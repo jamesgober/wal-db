@@ -51,11 +51,11 @@ default = ["std"]
 std = []
 # Group commit batching (default-on once 0.3 lands).
 batching = []
-# Optional integration with serial-io for record framing.
-serial-io = ["dep:serial-io"]
+# Optional integration with pack-io for record framing.
+pack-io = ["dep:pack-io"]
 
 [dependencies]
-serial-io = { version = "0.1", optional = true, default-features = false }
+pack-io = { version = "0.1", optional = true, default-features = false }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

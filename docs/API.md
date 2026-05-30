@@ -85,7 +85,7 @@ _Domain error type built on `error-forge`. Variants documented at 0.2._
 |---------|---------|-------------|
 | `std`        | yes | Standard library. Off → `no_std` (in-memory backend only). |
 | `batching`   | no  | Group commit batching (default-on once stabilised at 0.3). |
-| `serial-io`  | no  | Typed record framing via `serial-io`. |
+| `pack-io`    | no  | Typed record framing via `pack-io`. |
 
 ---
 

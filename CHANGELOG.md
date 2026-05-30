@@ -28,7 +28,7 @@ Initial scaffold and repository bootstrap. No WAL logic yet — this release est
 ### Added
 
 - `Cargo.toml` with full crate metadata, Rust 2024 edition, MSRV 1.85, dual `Apache-2.0 OR MIT` license, `docs.rs` configuration, perf-tuned release profile.
-- Feature flags: `std` (default), `batching`, `serial-io` (optional record framing).
+- Feature flags: `std` (default), `batching`, `pack-io` (optional record framing).
 - Dev-dependencies for the test stack: `criterion`, `proptest`, `tempfile`, and `loom` under `cfg(loom)`.
 - `README.md` — overview, the "why a shared WAL primitive" positioning, Tier-1 quick start, group-commit example, cross-platform durability notes.
 - `docs/API.md` reference skeleton.

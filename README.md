@@ -62,7 +62,7 @@
 - **Torn-write detection** — per-record checksums; recovery stops at the last verifiable record
 - **Replay iterator** — fast forward iteration for state recovery
 - **Pluggable backend** — file, in-memory, or custom storage adapter
-- **`serial-io` integration** — optional, for typed record framing
+- **`pack-io` integration** — optional, for typed record framing
 
 <br>
 
@@ -72,8 +72,8 @@
 [dependencies]
 wal-db = "0.1"
 
-# With serial-io framing:
-wal-db = { version = "0.1", features = ["serial-io"] }
+# With pack-io framing:
+wal-db = { version = "0.1", features = ["pack-io"] }
 ```
 
 <br>
