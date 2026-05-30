@@ -1,0 +1,77 @@
+# ██████╗ ███████╗██████╗ ███████╗
+# ██╔══██╗██╔════╝██╔══██╗██╔════╝
+# ██████╔╝█████╗  ██████╔╝███████╗
+# ██╔══██╗██╔══╝  ██╔═══╝ ╚════██║
+# ██║  ██║███████╗██║     ███████║
+# ╚═╝  ╚═╝╚══════╝╚═╝     ╚══════╝
+#╔═══════════════════════════════╗
+#║ Rust Efficiency & Performance ║
+#╚═══════════════════════════════╝
+[package]
+name    = "wal-db"
+version = "0.1.0"
+
+rust-version = "1.85"
+edition = "2024"
+license = "Apache-2.0 OR MIT"
+readme  = "README.md"
+
+description = "Write-ahead log primitive for Rust storage engines. Durable, recoverable, lock-free append path. The WAL substrate under lsm-db, txn-db, raft-io, and Hive DB."
+
+keywords = [
+    "wal",
+    "write-ahead-log",
+    "database",
+    "durability",
+    "recovery"
+]
+
+categories = [
+    "database-implementations",
+    "filesystem",
+    "concurrency"
+]
+
+homepage      = "https://github.com/jamesgober/wal-db"
+repository    = "https://github.com/jamesgober/wal-db"
+documentation = "https://docs.rs/wal-db"
+
+authors = ["James Gober <me@jamesgober.com>"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lib]
+name = "wal_db"
+path = "src/lib.rs"
+
+[features]
+default = ["std"]
+std = []
+# Group commit batching (default-on once 0.3 lands).
+batching = []
+# Optional integration with serial-io for record framing.
+serial-io = ["dep:serial-io"]
+
+[dependencies]
+serial-io = { version = "0.1", optional = true, default-features = false }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+proptest  = "1"
+tempfile  = "3"
+
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
+[[bench]]
+name    = "wal_bench"
+harness = false
+
+[profile.release]
+opt-level     = 3
+lto           = "fat"
+codegen-units = 1
+panic         = "abort"
+strip         = "symbols"
