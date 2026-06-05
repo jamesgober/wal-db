@@ -184,9 +184,23 @@ divided into fixed-size segment files).
 
 Recovery is the same forward scan as above, reading through segment boundaries
 transparently. It ends when a read returns short — either a torn record (as
-above) or a missing segment file, which marks the end of the log. Truncating the
-log to length `L` shrinks the segment containing `L` to `L % S` bytes and deletes
-every segment file with index greater than `L / S`.
+above) or a missing segment file, which marks the end of the log. Suffix
+truncation to length `L` shrinks the segment containing `L` to `L % S` bytes and
+deletes every segment file with index greater than `L / S`.
+
+### Prefix truncation and the `head` marker
+
+A segmented log can also drop its **prefix** — reclaim old, already-applied
+records — by deleting whole leading segment files. Because records span segments,
+the lowest surviving segment may begin in the middle of a record, so recovery
+cannot infer where the first complete record starts. The directory therefore
+holds an optional file named `head`: 8 little-endian bytes giving the byte offset
+of the first surviving record (a real record boundary). It is written and flushed
+*before* any segment is deleted, so a crash mid-truncation still recovers from the
+correct boundary. The file is absent until the first prefix truncation; when
+absent, the head is 0. A reader that does not understand the `head` file ignores
+it (it is not a `.wal` segment), which is safe only for logs that never had a
+prefix dropped.
 
 <hr>
 <br>

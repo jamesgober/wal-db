@@ -79,6 +79,9 @@ pub struct Wal<S = FileStore> {
     store: S,
     max_record_size: u32,
     recovery_policy: RecoveryPolicy,
+    /// Lowest readable offset — `0` until a prefix is dropped by
+    /// [`truncate_before`](Wal::truncate_before).
+    head: AtomicU64,
     commit: Commit,
 }
 
@@ -228,12 +231,14 @@ impl<S: WalStore> Wal<S> {
     /// # }
     /// ```
     pub fn with_store_and_config(store: S, config: WalConfig) -> Result<Self> {
-        let recovered = recover(&store, config.max_record_size())?;
+        let head = store.head()?;
+        let recovered = recover(&store, config.max_record_size(), head)?;
         Ok(Wal {
             tail: CacheAligned(AtomicU64::new(recovered)),
             store,
             max_record_size: config.max_record_size(),
             recovery_policy: config.recovery_policy(),
+            head: AtomicU64::new(head),
             commit: Commit::new(recovered),
         })
     }
@@ -437,7 +442,7 @@ impl<S: WalStore> Wal<S> {
         let end = self.commit.committed();
         Ok(WalIter {
             wal: self,
-            offset: 0,
+            offset: self.head.load(Ordering::Acquire),
             end,
             done: false,
             policy: self.recovery_policy,
@@ -474,9 +479,11 @@ impl<S: WalStore> Wal<S> {
     /// ```
     pub fn iter_from(&self, from: Lsn) -> Result<WalIter<'_, S>> {
         let end = self.commit.committed();
+        // Never read below the head: a dropped prefix is gone.
+        let start = from.get().max(self.head.load(Ordering::Acquire)).min(end);
         Ok(WalIter {
             wal: self,
-            offset: from.get().min(end),
+            offset: start,
             end,
             done: false,
             policy: self.recovery_policy,
@@ -556,6 +563,61 @@ impl<S: WalStore> Wal<S> {
         Ok(())
     }
 
+    /// Drop the records before the one at `lsn`, keeping the log from there on,
+    /// and return the new head [`Lsn`] — the lowest record still present.
+    ///
+    /// This is prefix compaction: once a consumer has durably applied (and
+    /// flushed elsewhere) everything up to a checkpoint, the old records can be
+    /// reclaimed. Offsets are preserved — surviving records keep their LSNs — so
+    /// [`iter`](Wal::iter) and [`iter_from`](Wal::iter_from) continue to work.
+    ///
+    /// Removal is at the backend's granularity. A segmented log
+    /// ([`Wal::open_segmented`](Wal::open_segmented)) drops whole leading segment
+    /// files, so the returned head may be *below* `lsn` — at the start of the
+    /// segment that holds it — and the segment with the most recent records is
+    /// never dropped. A single-file log cannot reclaim a prefix without moving the
+    /// surviving bytes (which would change their LSNs), so it is left unchanged and
+    /// the returned head is `Lsn(0)`.
+    ///
+    /// # Exclusive access
+    ///
+    /// Like [`truncate_after`](Wal::truncate_after), this must **not** run
+    /// concurrently with [`append`](Wal::append), [`sync`](Wal::sync),
+    /// [`iter`](Wal::iter), or another truncation: it removes files a reader could
+    /// be holding open. Quiesce other users first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WalError::Io`] if the removal fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use wal_db::Wal;
+    /// # fn main() -> Result<(), wal_db::WalError> {
+    /// # let dir = tempfile::tempdir().map_err(wal_db::WalError::from)?;
+    /// // 32-byte segments so a handful of records spans several files.
+    /// let wal = Wal::open_segmented(dir.path(), 32)?;
+    /// for i in 0..10 {
+    ///     let _ = wal.append(format!("record {i}").as_bytes())?;
+    /// }
+    /// let checkpoint = wal.append(b"checkpoint")?;
+    /// wal.sync()?;
+    ///
+    /// // Reclaim everything before the checkpoint's segment.
+    /// let head = wal.truncate_before(checkpoint)?;
+    /// assert!(head <= checkpoint);
+    /// // Iteration now starts at (or before) the checkpoint, never at 0.
+    /// assert!(wal.iter()?.next().unwrap()?.lsn() >= head);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn truncate_before(&self, lsn: Lsn) -> Result<Lsn> {
+        let new_head = self.store.truncate_before(lsn.get())?;
+        self.head.store(new_head, Ordering::Release);
+        Ok(Lsn::new(new_head))
+    }
+
     /// The logical size of the log in bytes, including record framing.
     ///
     /// This is the offset at which the next append will land. It counts bytes
@@ -607,9 +669,10 @@ fn with_frame_buffer<R>(f: impl FnOnce(&mut Vec<u8>) -> R) -> R {
 
 /// Scan a store from the start, returning the end offset of the last intact
 /// record and truncating any torn tail beyond it.
-fn recover<S: WalStore>(store: &S, max_record_size: u32) -> Result<u64> {
+fn recover<S: WalStore>(store: &S, max_record_size: u32, head: u64) -> Result<u64> {
     let physical = store.len()?;
-    let mut offset: u64 = 0;
+    // Scan from the head: a log whose prefix was dropped no longer starts at 0.
+    let mut offset: u64 = head;
     let mut header = [0u8; HEADER_LEN];
     // One reused payload buffer for the whole scan: only the checksum needs the
     // bytes, so the buffer is refilled per record rather than reallocated.

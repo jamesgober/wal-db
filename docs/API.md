@@ -37,6 +37,7 @@
   - [`Wal::iter`](#waliter)
   - [`Wal::iter_from`](#waliter_from)
   - [`Wal::truncate_after`](#waltruncate_after)
+  - [`Wal::truncate_before`](#waltruncate_before)
   - [`Wal::len` / `Wal::is_empty`](#wallen--walis_empty)
   - [`Lsn`](#lsn)
   - [`Record`](#record)
@@ -88,10 +89,10 @@ iterator-based and stops at the first torn or corrupt record.
 
 ```toml
 [dependencies]
-wal-db = "0.8"
+wal-db = "0.9"
 
 # Typed records via pack-io:
-wal-db = { version = "0.8", features = ["pack-io"] }
+wal-db = { version = "0.9", features = ["pack-io"] }
 ```
 
 The default feature set is empty; the crate is standard-library only.
@@ -499,6 +500,53 @@ assert_eq!(wal.iter()?.count(), 2);
 # }
 ```
 
+### `Wal::truncate_before`
+
+```rust
+pub fn truncate_before(&self, lsn: Lsn) -> Result<Lsn>
+```
+
+Drop the records *before* the one at `lsn` — prefix compaction — and return the
+new head [`Lsn`](#lsn), the lowest record still present. The complement of
+[`truncate_after`](#waltruncate_after): once a consumer has durably applied
+everything up to a checkpoint, the old records can be reclaimed. **Offsets are
+preserved** — surviving records keep their LSNs, so [`iter`](#waliter) and
+[`iter_from`](#waliter_from) keep working.
+
+Removal is at the storage backend's granularity. A **segmented** log
+([`Wal::open_segmented`](#walopen_segmented)) deletes whole leading segment files
+and records the new head durably, so a crash recovers from the same boundary; the
+returned head may be below `lsn` (at the start of the segment that holds it), and
+the segment with the most recent records is never dropped. A **single-file** log
+cannot reclaim a prefix without moving the surviving bytes (which would change
+their LSNs), so it is left unchanged and the returned head is `Lsn(0)`.
+
+Like [`truncate_after`](#waltruncate_after), this requires **exclusive access** —
+no concurrent `append`, `sync`, `iter`, or other truncation — because it removes
+files a reader could be holding open.
+
+**Returns** the new head `Lsn`, or [`WalError::Io`](#walerror) if the removal
+fails.
+
+```rust
+use wal_db::Wal;
+
+# fn main() -> Result<(), wal_db::WalError> {
+# let dir = tempfile::tempdir().map_err(wal_db::WalError::from)?;
+let wal = Wal::open_segmented(dir.path(), 32)?; // small segments to span several files
+for i in 0..10 {
+    let _ = wal.append(format!("record {i}").as_bytes())?;
+}
+let checkpoint = wal.append(b"checkpoint")?;
+wal.sync()?;
+
+let head = wal.truncate_before(checkpoint)?;
+assert!(head <= checkpoint);
+assert!(wal.iter()?.next().unwrap()?.lsn() >= head);
+# Ok(())
+# }
+```
+
 ### `Wal::len` / `Wal::is_empty`
 
 ```rust
@@ -754,8 +802,15 @@ pub trait WalStore: Send + Sync {
     fn sync(&self) -> Result<()>;
     fn len(&self) -> Result<u64>;
     fn is_empty(&self) -> Result<bool> { /* defaults to len() == 0 */ }
+    fn head(&self) -> Result<u64> { /* defaults to 0 */ }
+    fn truncate_before(&self, offset: u64) -> Result<u64> { /* defaults to a no-op */ }
 }
 ```
+
+The two `head` / `truncate_before` methods have defaults, so existing backends
+need not change: `head` reports the lowest offset still present (0 unless a
+prefix was dropped), and `truncate_before` reclaims storage below an offset if the
+backend can — a single file cannot, a segmented store deletes leading segments.
 
 A byte-addressable, append-only store with an explicit durability barrier. The
 log frames records and hands out byte offsets; a `WalStore` just holds the bytes.

@@ -32,7 +32,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). Lock-free append. Group commit. Explicit fsync. Crash-safe recovery.
     </p>
     <blockquote>
-        <strong>Status: pre-1.0, feature-frozen, API frozen.</strong> Full feature set, lock-free and group-committing, with a <a href="./docs/ON_DISK_FORMAT.md">1.x-frozen on-disk format</a>. Hardened with a fuzz harness, loom model checks, adversarial recovery tests, and injected I/O-failure tests; measured against a hand-rolled WAL (<a href="./docs/BENCHMARKS.md">benchmarks</a>). The remaining road to <code>1.0</code> is consumer integration and a stability soak. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for detail.
+        <strong>Status: pre-1.0, API stable.</strong> Full feature set — lock-free, group-committing, with suffix and prefix compaction and a <a href="./docs/ON_DISK_FORMAT.md">1.x-frozen on-disk format</a>. Hardened with a fuzz harness, loom model checks, adversarial recovery tests, and injected I/O-failure tests; measured against a hand-rolled WAL (<a href="./docs/BENCHMARKS.md">benchmarks</a>). The remaining road to <code>1.0</code> is consumer integration and a stability soak. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for detail.
     </blockquote>
 </div>
 
@@ -51,7 +51,7 @@
 - **Self-healing recovery** — a torn tail from a crash mid-append is truncated on open, leaving a clean boundary
 - **Fuzz-hardened recovery** — arbitrary bytes never panic or over-allocate; a continuous `cargo-fuzz` harness proves it
 - **Recovery policies** — stop at the first damaged record, or skip past it for forensic partial recovery
-- **LSN seeking & truncation** — replay from any LSN (`iter_from`); drop everything after one (`truncate_after`) for compaction
+- **LSN seeking & truncation** — replay from any LSN (`iter_from`); drop everything after one (`truncate_after`) or, on a segmented log, reclaim everything before one (`truncate_before`) for compaction
 - **Iterator-based replay** — walk the log forward to rebuild state
 - **Typed records (optional)** — serialise any value via `pack-io` behind a feature; the byte-record API is unchanged when off
 - **Pluggable storage backend** — file-backed by default; injectable for in-memory testing and custom stores
@@ -79,7 +79,7 @@ That flush is not the same call on every platform, and getting it wrong is silen
 
 ```toml
 [dependencies]
-wal-db = "0.8"
+wal-db = "0.9"
 ```
 
 <br>
@@ -233,7 +233,7 @@ By default a record is bytes. With the `pack-io` feature, a record can be any ty
 
 ```toml
 [dependencies]
-wal-db = { version = "0.8", features = ["pack-io"] }
+wal-db = { version = "0.9", features = ["pack-io"] }
 ```
 
 ```rust
@@ -283,7 +283,7 @@ for entry in wal.iter()? {
 
 ## Seeking and compaction
 
-An LSN is a byte offset, so replaying from a checkpoint is O(1) — `iter_from` starts at the LSN instead of scanning from the beginning. When a consumer has durably applied the log up to some point, `truncate_after` drops everything after that record, the durable building block of compaction:
+An LSN is a byte offset, so replaying from a checkpoint is O(1) — `iter_from` starts at the LSN instead of scanning from the beginning. `truncate_after` drops everything *after* a record (rolling back a tail, the way a Raft log does on a conflict), and on a segmented log `truncate_before` reclaims everything *before* a record (prefix compaction once it has been applied and flushed elsewhere). Both preserve the LSNs of surviving records:
 
 ```rust
 use wal_db::Wal;

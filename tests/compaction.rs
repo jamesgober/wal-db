@@ -83,3 +83,120 @@ fn truncate_after_on_segmented_log_removes_segments() {
         ]
     );
 }
+
+fn wal_files(dir: &std::path::Path) -> usize {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .filter(|e| {
+            e.as_ref()
+                .unwrap()
+                .file_name()
+                .to_str()
+                .unwrap()
+                .ends_with(".wal")
+        })
+        .count()
+}
+
+#[test]
+fn truncate_before_drops_leading_segments_and_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // 24-byte segments + ~12-byte records => records span segment boundaries, so
+    // the lowest surviving segment starts mid-record. The durable head marker is
+    // what makes recovery resume at the right boundary anyway.
+    let mut lsns = Vec::new();
+    {
+        let wal = Wal::open_segmented(dir.path(), 24).unwrap();
+        for i in 0..30u32 {
+            lsns.push(wal.append(format!("record-{i:03}").as_bytes()).unwrap());
+        }
+        wal.sync().unwrap();
+
+        let before = wal_files(dir.path());
+        let checkpoint = lsns[15];
+        let head = wal.truncate_before(checkpoint).unwrap();
+        assert!(head <= checkpoint);
+
+        // Some leading segment files were reclaimed.
+        assert!(wal_files(dir.path()) < before);
+
+        // Iteration starts at the head, and everything from the checkpoint on is
+        // still present; the early records are gone.
+        let surviving: Vec<u64> = wal
+            .iter()
+            .unwrap()
+            .map(|e| e.unwrap().lsn().get())
+            .collect();
+        assert_eq!(surviving.first().copied(), Some(head.get()));
+        for lsn in &lsns[15..] {
+            assert!(
+                surviving.contains(&lsn.get()),
+                "lsn {} should survive",
+                lsn.get()
+            );
+        }
+        assert!(!surviving.contains(&lsns[0].get()));
+    }
+
+    // Reopen: recovery resumes from the durable head, reading the surviving
+    // records back correctly even though the lowest segment starts mid-record.
+    let reopened = Wal::open_segmented(dir.path(), 24).unwrap();
+    let after_reopen: Vec<Vec<u8>> = reopened
+        .iter()
+        .unwrap()
+        .map(|e| e.unwrap().into_data())
+        .collect();
+    for i in 15..30u32 {
+        let want = format!("record-{i:03}").into_bytes();
+        assert!(
+            after_reopen.contains(&want),
+            "record-{i:03} should survive reopen"
+        );
+    }
+    assert!(!after_reopen.contains(&b"record-000".to_vec()));
+}
+
+#[test]
+fn truncate_before_on_a_single_file_is_a_noop() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("single.wal");
+    let wal = Wal::open(&path).unwrap();
+    let _ = wal.append(b"a").unwrap();
+    let b = wal.append(b"b").unwrap();
+    let _ = wal.append(b"c").unwrap();
+
+    // A single file cannot reclaim a prefix without moving the surviving bytes,
+    // so it is left unchanged and the head stays at 0.
+    let head = wal.truncate_before(b).unwrap();
+    assert_eq!(head.get(), 0);
+    assert_eq!(wal.iter().unwrap().count(), 3);
+}
+
+#[test]
+fn appends_continue_after_truncate_before() {
+    let dir = tempfile::tempdir().unwrap();
+    let wal = Wal::open_segmented(dir.path(), 24).unwrap();
+
+    let mut checkpoint = None;
+    for i in 0..15u32 {
+        let lsn = wal.append(format!("r{i}").as_bytes()).unwrap();
+        if i == 10 {
+            checkpoint = Some(lsn);
+        }
+    }
+    wal.sync().unwrap();
+    let checkpoint = checkpoint.unwrap();
+    let _ = wal.truncate_before(checkpoint).unwrap();
+
+    // Appends continue with monotonically increasing LSNs after compaction.
+    let next = wal.append(b"after").unwrap();
+    assert!(next > checkpoint);
+    let last = wal
+        .iter()
+        .unwrap()
+        .map(|e| e.unwrap().into_data())
+        .last()
+        .unwrap();
+    assert_eq!(last, b"after");
+}

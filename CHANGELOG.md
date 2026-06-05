@@ -18,6 +18,39 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [0.9.0] - 2026-06-05
+
+Prefix compaction — the complement to suffix truncation — so a consumer can
+reclaim old records after a checkpoint. Additive; no breaking changes.
+
+### Added
+
+- **`Wal::truncate_before(lsn)`** — drop the records before `lsn` and return the
+  new head LSN. On a segmented log it deletes whole leading segment files and
+  records the new head durably (so a crash recovers from the right boundary);
+  surviving records keep their LSNs. A single-file log cannot reclaim a prefix
+  without moving the surviving bytes, so it is left unchanged.
+- **`WalStore::head`** and **`WalStore::truncate_before`** — additive trait
+  methods with defaults (`head` reports the lowest present offset, `0` by
+  default; `truncate_before` is a no-op by default), so existing backends are
+  unaffected.
+
+### Changed
+
+- Recovery and iteration now resume from a log's **head** — the lowest surviving
+  offset — instead of always 0, so a prefix-compacted log reads back from the
+  right record boundary. For single-file and never-compacted logs the head stays
+  0 and behaviour is unchanged.
+
+### Notes
+
+- **On-disk:** after a prefix truncation, a segmented log's directory holds an
+  optional `head` file — 8 little-endian bytes giving the first surviving record's
+  offset. It is absent until the first `truncate_before`. See
+  `docs/ON_DISK_FORMAT.md`.
+
+---
+
 ## [0.8.0] - 2026-06-05
 
 A documentation-accuracy, examples, and edge-coverage pass — the polish before
@@ -352,7 +385,8 @@ Initial scaffold and repository bootstrap. No WAL logic yet — this release est
 - `.gitattributes` normalising line endings and excluding development paths from archives.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) — gitignored.
 
-[Unreleased]: https://github.com/jamesgober/wal-db/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/jamesgober/wal-db/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/jamesgober/wal-db/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/jamesgober/wal-db/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/jamesgober/wal-db/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jamesgober/wal-db/compare/v0.5.0...v0.6.0

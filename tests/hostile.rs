@@ -125,6 +125,30 @@ fn truncated_mid_payload_drops_the_partial_record() {
 }
 
 #[test]
+fn a_corrupt_head_marker_does_not_crash_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let wal = Wal::open_segmented(dir.path(), 32).unwrap();
+        for i in 0..10u32 {
+            let _ = wal.append(format!("rec{i}").as_bytes()).unwrap();
+        }
+        wal.sync().unwrap();
+    }
+
+    // A head marker pointing far past the end: clamped to the end on open, so
+    // recovery reads nothing and never over-reads or panics.
+    fs::write(dir.path().join("head"), u64::MAX.to_le_bytes()).unwrap();
+    let wal = Wal::open_segmented(dir.path(), 32).unwrap();
+    let _ = wal.iter().unwrap().count();
+
+    // A head marker landing mid-record: recovery reads a malformed record there
+    // and stops cleanly, again without panicking.
+    fs::write(dir.path().join("head"), 3u64.to_le_bytes()).unwrap();
+    let wal = Wal::open_segmented(dir.path(), 32).unwrap();
+    let _ = wal.iter().unwrap().count();
+}
+
+#[test]
 fn truncated_mid_header_drops_the_partial_record() {
     let (_dir, path) = build_log(&[b"whole"]);
 

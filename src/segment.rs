@@ -36,6 +36,9 @@ use crate::{
 const NAME_DIGITS: usize = 20;
 /// The segment file extension.
 const NAME_EXT: &str = "wal";
+/// Name of the file that records the log's head (its lowest surviving offset)
+/// after a prefix has been dropped. Absent until the first `truncate_before`.
+const HEAD_FILE: &str = "head";
 
 /// A [`WalStore`] that stripes one flat byte space across fixed-size segment
 /// files in a directory.
@@ -72,6 +75,9 @@ pub struct SegmentedStore {
     /// Index of the lowest segment that may still have unflushed writes. Every
     /// segment below it is full and durable, so `sync` skips it.
     synced_from: AtomicU64,
+    /// Lowest offset still present — the start of the lowest segment that has not
+    /// been dropped by `truncate_before`. Recovery scans from here.
+    head: AtomicU64,
 }
 
 impl SegmentedStore {
@@ -117,6 +123,10 @@ impl SegmentedStore {
             None => 0,
         };
         let active = total_len / segment_size;
+        // The head is the exact record boundary recorded by the last prefix
+        // truncation, or 0 for a log that has never had one. It is durable, so
+        // recovery resumes from the same place after a crash.
+        let head = read_head_file(&dir)?.unwrap_or(0).min(total_len);
 
         Ok(SegmentedStore {
             dir,
@@ -125,6 +135,7 @@ impl SegmentedStore {
             max_written: AtomicU64::new(total_len),
             // Everything already on disk is treated as durable on open.
             synced_from: AtomicU64::new(active),
+            head: AtomicU64::new(head),
         })
     }
 
@@ -198,6 +209,34 @@ impl SegmentedStore {
     /// Look up an already-open segment without touching the filesystem.
     fn open_segment(&self, index: u64) -> Option<Arc<File>> {
         self.read_map().get(&index).map(Arc::clone)
+    }
+
+    /// Durably record `head` so a later open resumes from the same boundary.
+    fn write_head_file(&self, head: u64) -> Result<()> {
+        let path = self.dir.join(HEAD_FILE);
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .map_err(|e| WalError::io("writing the head marker", e))?;
+        pwrite_all(&file, 0, &head.to_le_bytes())
+            .map_err(|e| WalError::io("writing the head marker", e))?;
+        durable_sync(&file).map_err(|e| WalError::io("flushing the head marker", e))?;
+        Ok(())
+    }
+}
+
+/// Read the durably recorded head, or `None` if no prefix has been dropped (or
+/// the marker is too short to trust, in which case the head is taken as 0).
+fn read_head_file(dir: &Path) -> Result<Option<u64>> {
+    match fs::read(dir.join(HEAD_FILE)) {
+        Ok(bytes) if bytes.len() >= 8 => Ok(Some(u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]))),
+        Ok(_) => Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(WalError::io("reading the head marker", error)),
     }
 }
 
@@ -302,6 +341,49 @@ impl WalStore for SegmentedStore {
 
     fn len(&self) -> Result<u64> {
         Ok(self.max_written.load(Ordering::Acquire))
+    }
+
+    fn head(&self) -> Result<u64> {
+        Ok(self.head.load(Ordering::Acquire))
+    }
+
+    fn truncate_before(&self, offset: u64) -> Result<u64> {
+        let written = self.max_written.load(Ordering::Acquire);
+        // The new head is the caller's record boundary, clamped so it never moves
+        // backwards and never past the end. It is a *record* boundary, not a
+        // segment boundary: because records span segments, the lowest surviving
+        // segment may start mid-record, so the head — and where recovery begins —
+        // must be the exact offset the caller gave.
+        let prev = self.head.load(Ordering::Acquire);
+        let new_head = offset.clamp(prev, written);
+
+        // Persist the head durably *before* deleting anything: a crash mid-delete
+        // then recovers from the right boundary, and the leftover segments below it
+        // are harmless dead space.
+        self.write_head_file(new_head)?;
+
+        // Delete every segment entirely below the one that holds the new head; that
+        // segment, and the one holding the most recent records, are always kept.
+        let last_segment = written.saturating_sub(1) / self.segment_size;
+        let keep_from = (new_head / self.segment_size).min(last_segment);
+        let entries =
+            fs::read_dir(&self.dir).map_err(|e| WalError::io("reading the log directory", e))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| WalError::io("reading the log directory", e))?;
+            let Some(index) = parse_segment_name(&entry.file_name()) else {
+                continue;
+            };
+            if index < keep_from {
+                // Drop our handle before unlinking — Windows refuses to remove a
+                // file that still has an open handle.
+                let _ = self.write_map().remove(&index);
+                fs::remove_file(entry.path())
+                    .map_err(|e| WalError::io("removing a dropped segment", e))?;
+            }
+        }
+
+        self.head.store(new_head, Ordering::Release);
+        Ok(new_head)
     }
 }
 

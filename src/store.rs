@@ -88,6 +88,30 @@ pub trait WalStore: Send + Sync {
     fn is_empty(&self) -> Result<bool> {
         Ok(self.len()? == 0)
     }
+
+    /// The lowest offset that still holds data.
+    ///
+    /// Normally `0`. A backend that can drop a prefix (see
+    /// [`truncate_before`](WalStore::truncate_before)) reports the offset of its
+    /// first surviving byte here, so recovery knows where to begin scanning. The
+    /// default backends that cannot drop a prefix leave this at `0`.
+    fn head(&self) -> Result<u64> {
+        Ok(0)
+    }
+
+    /// Discard storage entirely below `offset`, if the backend can, returning the
+    /// new [`head`](WalStore::head).
+    ///
+    /// Offsets are preserved: dropping a prefix never renumbers what remains, so
+    /// a record keeps its byte position (its LSN) for life. A backend that cannot
+    /// remove a prefix — a single file, where the surviving bytes would have to
+    /// move — leaves the store unchanged and returns its current head. One that
+    /// can (a segmented store, by deleting whole leading segment files) removes
+    /// what it can at its own granularity and returns the resulting head, which
+    /// may be below `offset`.
+    fn truncate_before(&self, _offset: u64) -> Result<u64> {
+        self.head()
+    }
 }
 
 /// A file-backed [`WalStore`]: the default storage for [`Wal::open`](crate::Wal::open).
