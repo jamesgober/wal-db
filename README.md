@@ -32,7 +32,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). Lock-free append. Group commit. Explicit fsync. Crash-safe recovery.
     </p>
     <blockquote>
-        <strong>Status: pre-1.0, feature-frozen, API frozen.</strong> <code>0.7</code> is the hardening pass — adversarial recovery inputs and injected I/O failures alongside the fuzz harness and loom model checks — and freezes the public API for the 1.x line. The feature set was complete at <code>0.5</code>; <code>0.6</code> measured and optimized it (<a href="./docs/BENCHMARKS.md">benchmarks</a>). See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for detail.
+        <strong>Status: pre-1.0, feature-frozen, API frozen.</strong> Full feature set, lock-free and group-committing, with a <a href="./docs/ON_DISK_FORMAT.md">1.x-frozen on-disk format</a>. Hardened with a fuzz harness, loom model checks, adversarial recovery tests, and injected I/O-failure tests; measured against a hand-rolled WAL (<a href="./docs/BENCHMARKS.md">benchmarks</a>). The remaining road to <code>1.0</code> is consumer integration and a stability soak. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for detail.
     </blockquote>
 </div>
 
@@ -79,7 +79,7 @@ That flush is not the same call on every platform, and getting it wrong is silen
 
 ```toml
 [dependencies]
-wal-db = "0.4"
+wal-db = "0.8"
 ```
 
 <br>
@@ -233,7 +233,7 @@ By default a record is bytes. With the `pack-io` feature, a record can be any ty
 
 ```toml
 [dependencies]
-wal-db = { version = "0.4", features = ["pack-io"] }
+wal-db = { version = "0.8", features = ["pack-io"] }
 ```
 
 ```rust
@@ -346,6 +346,7 @@ cargo bench --bench compare     # wal-db vs a hand-rolled inline WAL
 | [`basic`](./examples/basic.rs) | `cargo run --example basic` | the four-call API: open, append, sync, replay |
 | [`recovery`](./examples/recovery.rs) | `cargo run --example recovery` | a simulated torn write and self-healing recovery |
 | [`concurrent`](./examples/concurrent.rs) | `cargo run --example concurrent` | many writers, one log, group commit |
+| [`checkpoint`](./examples/checkpoint.rs) | `cargo run --example checkpoint` | replay from a checkpoint (`iter_from`) and truncate back to one (`truncate_after`) |
 | [`typed`](./examples/typed.rs) | `cargo run --example typed --features pack-io` | typed records via `pack-io` |
 
 <br>

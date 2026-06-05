@@ -18,8 +18,9 @@
 
 > Complete reference for every public item in `wal-db`, with runnable examples.
 >
-> **Status: 0.2 (foundation).** The four-call API documented here is stable. The
-> on-disk format is unstable across the 0.x series and freezes for 1.x in 0.3.
+> **Status: API frozen for the 1.x line.** Every item below is stable; the on-disk
+> format is frozen (records in 0.3.0, segment layout in 0.3.1). See
+> [`docs/ON_DISK_FORMAT.md`](./ON_DISK_FORMAT.md).
 
 <a id="top"></a>
 
@@ -70,9 +71,9 @@ The API is layered:
 
 | Tier | Surface | For |
 |------|---------|-----|
-| 1 | `Wal::open` / `append` / `sync` / `iter` | the common case — four calls, no generics to name |
-| 2 | `WalConfig`, `Wal::open_with` | tuning record limits (and, later, sync policy and segments) |
-| 3 | `WalStore`, `FileStore`, `MemStore`, `Wal::with_store` | custom storage backends |
+| 1 | `Wal::open` / `append` / `sync` / `iter` (+ `append_and_sync`, `append_typed`, `iter_from`, `truncate_after`) | the common case — four calls, no generics to name |
+| 2 | `WalConfig`, `RecoveryPolicy`, `Wal::open_with`, `Wal::open_segmented` | tuning record limits, recovery policy, segment rotation |
+| 3 | `WalStore`, `FileStore`, `MemStore`, `SegmentedStore`, `Wal::with_store` | custom and segmented storage backends |
 
 Durability is explicit: `append` returns when the record is buffered in the OS
 page cache; `sync` returns when it is on stable storage. Recovery is
@@ -87,10 +88,10 @@ iterator-based and stops at the first torn or corrupt record.
 
 ```toml
 [dependencies]
-wal-db = "0.4"
+wal-db = "0.8"
 
 # Typed records via pack-io:
-wal-db = { version = "0.4", features = ["pack-io"] }
+wal-db = { version = "0.8", features = ["pack-io"] }
 ```
 
 The default feature set is empty; the crate is standard-library only.

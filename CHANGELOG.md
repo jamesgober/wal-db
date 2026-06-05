@@ -18,6 +18,40 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [0.8.0] - 2026-06-05
+
+A documentation-accuracy, examples, and edge-coverage pass — the polish before
+consumer integration. No public API change.
+
+### Added
+
+- `examples/checkpoint.rs` — replay from a checkpoint with `iter_from`, then
+  truncate the log back to it with `truncate_after`.
+- `tests/edge.rs` — boundary and edge coverage: a record exactly at the size
+  limit is accepted and one byte over is rejected, a maximum-size record
+  round-trips through recovery, a thousand empty records, alternating empty and
+  full records, the on-disk image is byte-for-byte deterministic, and `len` /
+  `is_empty` track the log exactly.
+
+### Fixed
+
+- Documentation accuracy: the install snippets in `README.md` and `docs/API.md`,
+  and the `docs/API.md` status header (which still read "0.2 foundation"), now
+  reflect the current version and the frozen API. The API reference's tier tables
+  list the segment and recovery-policy surface that shipped after they were
+  written.
+
+### Notes
+
+- An audit of the codebase confirmed the hot path and integrity guarantees are at
+  the level the design allows: a ~4 ns lock-free LSN reservation, a syscall-bound
+  (not lock-bound) file append, a conservative durable watermark that never
+  over-reports (loom-verified), bounded-allocation recovery (fuzz-verified), a
+  per-record CRC32C, and a byte-deterministic on-disk format. No issues were
+  found that warranted a code change.
+
+---
+
 ## [0.7.0] - 2026-06-05
 
 Hardening, and the API freeze. Adversarial recovery inputs and injected I/O
@@ -318,7 +352,8 @@ Initial scaffold and repository bootstrap. No WAL logic yet — this release est
 - `.gitattributes` normalising line endings and excluding development paths from archives.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) — gitignored.
 
-[Unreleased]: https://github.com/jamesgober/wal-db/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/jamesgober/wal-db/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/jamesgober/wal-db/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/jamesgober/wal-db/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jamesgober/wal-db/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jamesgober/wal-db/compare/v0.4.0...v0.5.0
