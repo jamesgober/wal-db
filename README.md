@@ -32,7 +32,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). Lock-free append. Group commit. Explicit fsync. Crash-safe recovery.
     </p>
     <blockquote>
-        <strong>Status: pre-1.0, feature-frozen.</strong> <code>0.6</code> is the optimization pass — measured, with an honest <a href="./docs/BENCHMARKS.md">benchmark suite</a> and head-to-head vs a hand-rolled WAL. The feature set (LSN seeking, compaction truncation, recovery hardening, typed records, segment rotation, lock-free append, group commit, <a href="./docs/ON_DISK_FORMAT.md">1.x-frozen format</a>) was complete at <code>0.5</code>. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for detail.
+        <strong>Status: pre-1.0, feature-frozen, API frozen.</strong> <code>0.7</code> is the hardening pass — adversarial recovery inputs and injected I/O failures alongside the fuzz harness and loom model checks — and freezes the public API for the 1.x line. The feature set was complete at <code>0.5</code>; <code>0.6</code> measured and optimized it (<a href="./docs/BENCHMARKS.md">benchmarks</a>). See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for detail.
     </blockquote>
 </div>
 

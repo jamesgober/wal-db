@@ -18,6 +18,40 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [0.7.0] - 2026-06-05
+
+Hardening, and the API freeze. Adversarial recovery inputs and injected I/O
+failures join the fuzz harness and loom model checks, and the public surface is
+now stable for the 1.x line. No public API change.
+
+### Added
+
+- `tests/hostile.rs` — named adversarial recovery cases: a garbage prefix, an
+  implausible length (rejected before any allocation), all-zeros, a garbage tail
+  after valid records, a corrupt middle record, and truncation mid-header and
+  mid-payload. Each asserts recovery reads all-and-only the intact records and
+  never trusts an unverified length or checksum.
+- `tests/faults.rs` — injected I/O failures through the `WalStore` seam: a
+  disk-full append surfaces the error and leaves the earlier records intact, a
+  failed write fail-stops the log so a later sync reports the truncation rather
+  than a false durability, and an fsync failure is always reported.
+
+### Changed
+
+- **API frozen.** The public surface will not change in a breaking way before
+  2.0. `WalError` and `RecoveryPolicy` are `#[non_exhaustive]`, `WalConfig` is a
+  builder, and `WalStore`'s one non-required method has a default, so the surface
+  can still grow additively.
+
+### Notes
+
+- Cross-platform durability is re-verified by the cross-process durability test in
+  the CI matrix on Linux, macOS, and Windows. The macOS "kernel reports success
+  but the device did not flush" bug is avoided structurally by using
+  `fcntl(F_FULLFSYNC)`.
+
+---
+
 ## [0.6.0] - 2026-06-05
 
 The optimization pass — measurement-driven, with an honest benchmark suite. No
@@ -284,7 +318,8 @@ Initial scaffold and repository bootstrap. No WAL logic yet — this release est
 - `.gitattributes` normalising line endings and excluding development paths from archives.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) — gitignored.
 
-[Unreleased]: https://github.com/jamesgober/wal-db/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/jamesgober/wal-db/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/jamesgober/wal-db/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jamesgober/wal-db/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jamesgober/wal-db/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/wal-db/compare/v0.3.1...v0.4.0
