@@ -32,7 +32,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). Lock-free append. Group commit. Explicit fsync. Crash-safe recovery.
     </p>
     <blockquote>
-        <strong>Status: pre-1.0, feature-frozen at <code>0.5</code>.</strong> <code>0.5</code> completes the feature set — LSN seeking (<code>iter_from</code>) and truncation for compaction (<code>truncate_after</code>), with recorded <a href="./docs/BENCHMARKS.md">benchmarks</a>. On top of recovery hardening and typed records (<code>0.4</code>), segment rotation (<code>0.3.1</code>), and the lock-free append, group commit, and <a href="./docs/ON_DISK_FORMAT.md">1.x-frozen format</a> (<code>0.3.0</code>). See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for detail.
+        <strong>Status: pre-1.0, feature-frozen.</strong> <code>0.6</code> is the optimization pass — measured, with an honest <a href="./docs/BENCHMARKS.md">benchmark suite</a> and head-to-head vs a hand-rolled WAL. The feature set (LSN seeking, compaction truncation, recovery hardening, typed records, segment rotation, lock-free append, group commit, <a href="./docs/ON_DISK_FORMAT.md">1.x-frozen format</a>) was complete at <code>0.5</code>. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for detail.
     </blockquote>
 </div>
 
@@ -316,25 +316,25 @@ let wal = wal.clone(); // Arc<Wal>
 let lsn = tokio::task::spawn_blocking(move || wal.append_and_sync(b"record")).await??;
 ```
 
-Skipping is never silent — each damaged record is still surfaced as an error — and it only works while a record's length prefix is intact enough to locate the next one.
-
 <br>
 
 ## Performance
 
-Numbers from the criterion suite (`cargo bench`) on the development machine, with 256-byte records. They are honest measurements, not marketing — the group-commit figure in particular is bounded by this machine's fsync latency and scales with faster storage and more concurrent writers.
+Numbers from the criterion suite on the development machine, 256-byte records. They are honest measurements, not marketing — the commit figures are bounded by this machine's fsync latency and scale with faster storage and more writers. Full detail and method in [`docs/BENCHMARKS.md`](./docs/BENCHMARKS.md).
 
 | Benchmark | Result | What it measures |
 |-----------|--------|------------------|
-| `append/single` | ~107 ns | the lock-free hot path: framing one record into memory, no I/O |
-| `append/multi` (8 writers) | ~3.6 M appends/s | many writers appending at once |
-| `commit/single` | ~0.9 ms | one writer, append + fsync each time (unbatched durability) |
-| `commit/group` (8 writers) | ~4× the single rate | concurrent append-and-sync, fsyncs coalesced by group commit |
+| LSN reservation | ~4 ns | the single atomic that allocates an LSN and reserves a byte range |
+| `append/single` | ~105 ns | the lock-free hot path: reserve, frame, write one record to memory, no syscall |
+| `append/multi` (8, file) | ~160 K/s | file-backed multi-writer append — syscall-bound (one `pwrite` each) |
+| `commit/group` (8 writers) | **~1.9× a hand-rolled inline WAL** | concurrent append-and-sync; group commit coalesces the fsyncs |
+| `recovery/replay` (10k) | ~215 K records/s | reopen and replay a file-backed log |
 
-Run them yourself:
+A file-backed append is syscall-bound, not lock-bound — the `pwrite` the durability contract requires dominates the negligible commit-watermark lock — so the throughput lever is **group commit**, which beats the inline WAL an engine hand-rolls before it has batching. Run them yourself:
 
 ```bash
-cargo bench --bench wal_bench
+cargo bench --bench wal_bench   # append, commit, recovery, reservation
+cargo bench --bench compare     # wal-db vs a hand-rolled inline WAL
 ```
 
 <br>

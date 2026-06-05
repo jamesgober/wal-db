@@ -9,7 +9,7 @@
 #╚═══════════════════════════════╝
 [package]
 name    = "wal-db"
-version = "0.5.0"
+version = "0.6.0"
 
 rust-version = "1.85"
 edition = "2024"
@@ -95,6 +95,10 @@ loom = "0.7"
 
 [[bench]]
 name    = "wal_bench"
+harness = false
+
+[[bench]]
+name    = "compare"
 harness = false
 
 # The typed-records example needs the `pack-io` feature, so it is only built

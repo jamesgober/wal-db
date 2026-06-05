@@ -18,6 +18,43 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [0.6.0] - 2026-06-05
+
+The optimization pass — measurement-driven, with an honest benchmark suite. No
+public API change.
+
+### Added
+
+- `benches/compare.rs` — a head-to-head against a hand-rolled inline WAL
+  (`Mutex<File>` + fsync per commit). wal-db's group commit is **~1.9× faster**
+  for eight concurrent durable committers, from coalescing fsyncs and never taking
+  a global lock on the write path.
+- A `reservation/fetch_add` microbenchmark (the LSN-allocation primitive, ~4 ns)
+  and a file-backed multi-writer append benchmark.
+- `docs/BENCHMARKS.md` records the full 0.6 baseline, the comparison, and the
+  measurement findings.
+
+### Changed
+
+- The recovery scan no longer allocates a buffer per record — it reuses one —
+  cutting recovery-replay time by ~12%.
+
+### Performance notes
+
+- The LSN reservation is a single atomic at **~4 ns**.
+- A file-backed append is **syscall-bound** (the `pwrite` the page-cache
+  durability contract requires), not lock-bound. The commit-watermark mutex is
+  negligible against it, so the append data plane stays lock-free and the
+  watermark keeps its short, correct, loom-verified lock — the planned lock-free
+  watermark rewrite was deliberately **not** done, because the measurement shows
+  it would not move the number and would risk the integrity guarantees.
+- O_DIRECT was evaluated and **not** implemented: it requires aligning every
+  buffer, offset, and size — which a variable-size record stream violates — and
+  does not reduce the per-append syscall or the fsync, so it offers no clear
+  benefit for this workload.
+
+---
+
 ## [0.5.0] - 2026-06-05
 
 Feature complete. LSN seeking and compaction truncation round out what a storage
@@ -247,7 +284,8 @@ Initial scaffold and repository bootstrap. No WAL logic yet — this release est
 - `.gitattributes` normalising line endings and excluding development paths from archives.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) — gitignored.
 
-[Unreleased]: https://github.com/jamesgober/wal-db/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/jamesgober/wal-db/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/jamesgober/wal-db/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jamesgober/wal-db/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/wal-db/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/jamesgober/wal-db/compare/v0.3.0...v0.3.1

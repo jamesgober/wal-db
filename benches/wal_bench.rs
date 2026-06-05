@@ -116,6 +116,49 @@ fn bench_commit_group(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_reservation(c: &mut Criterion) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // wal-db allocates an LSN and reserves a byte range with exactly this single
+    // atomic step; everything else on the append path is framing and the write.
+    let tail = AtomicU64::new(0);
+    c.bench_function("reservation/fetch_add", |b| {
+        b.iter(|| black_box(tail.fetch_add(black_box(264), Ordering::Relaxed)));
+    });
+}
+
+fn bench_append_multi_filestore(c: &mut Criterion) {
+    const THREADS: usize = 8;
+    const OPS_PER_THREAD: usize = 2_000;
+    let batch = (THREADS * OPS_PER_THREAD) as u64;
+
+    let mut group = c.benchmark_group("append/multi/filestore");
+    group.throughput(Throughput::Elements(batch));
+    group.bench_function(format!("{THREADS}x{OPS_PER_THREAD}"), |b| {
+        let dir = tempfile::tempdir().expect("temp dir");
+        b.iter_custom(|iters| {
+            let mut elapsed = Duration::ZERO;
+            for i in 0..iters {
+                let wal = Arc::new(Wal::open(dir.path().join(format!("a{i}.wal"))).expect("open"));
+                let start = Instant::now();
+                thread::scope(|scope| {
+                    for _ in 0..THREADS {
+                        let wal = Arc::clone(&wal);
+                        let _ = scope.spawn(move || {
+                            for _ in 0..OPS_PER_THREAD {
+                                let _ = wal.append(black_box(PAYLOAD)).expect("append");
+                            }
+                        });
+                    }
+                });
+                elapsed += start.elapsed();
+            }
+            elapsed
+        });
+    });
+    group.finish();
+}
+
 fn bench_recovery(c: &mut Criterion) {
     const RECORDS: u64 = 10_000;
 
@@ -145,8 +188,10 @@ fn bench_recovery(c: &mut Criterion) {
 
 criterion_group!(
     benches,
+    bench_reservation,
     bench_append_single,
     bench_append_multi,
+    bench_append_multi_filestore,
     bench_commit_single,
     bench_commit_group,
     bench_recovery

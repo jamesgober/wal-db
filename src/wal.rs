@@ -611,6 +611,9 @@ fn recover<S: WalStore>(store: &S, max_record_size: u32) -> Result<u64> {
     let physical = store.len()?;
     let mut offset: u64 = 0;
     let mut header = [0u8; HEADER_LEN];
+    // One reused payload buffer for the whole scan: only the checksum needs the
+    // bytes, so the buffer is refilled per record rather than reallocated.
+    let mut payload = Vec::new();
 
     while offset < physical {
         if store.read_at(offset, &mut header)? < HEADER_LEN {
@@ -625,8 +628,10 @@ fn recover<S: WalStore>(store: &S, max_record_size: u32) -> Result<u64> {
             Some(start) => start,
             None => break,
         };
-        let mut payload = vec![0u8; parsed.len as usize];
-        if store.read_at(payload_start, &mut payload)? < payload.len() {
+        let len = parsed.len as usize;
+        payload.clear();
+        payload.resize(len, 0);
+        if store.read_at(payload_start, &mut payload)? < len {
             break; // incomplete payload: torn tail
         }
         if !record::verify(&header, &payload, parsed.crc) {
