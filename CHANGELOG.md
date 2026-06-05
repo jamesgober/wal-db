@@ -18,6 +18,39 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [0.9.1] - 2026-06-05
+
+Release-candidate hardening of the 0.9.0 prefix-compaction feature, ahead of 1.0.
+
+### Fixed
+
+- **The segmented `head` marker is now checksummed** (`[head: u64][crc32c: u32]`).
+  A torn write of the marker itself — a crash partway through writing it — is now
+  detected on open and ignored, so recovery falls back to reading the whole log
+  instead of trusting a corrupt head and possibly skipping live records. The
+  fallback is always safe: a dropped prefix the marker can no longer vouch for is
+  re-read, never lost.
+- Documentation accuracy: `truncate_before`'s returned head is the **exact**
+  checkpoint LSN — reading resumes precisely there — while *reclamation* is
+  segment-granular. The earlier wording ("the head may sit at the start of the
+  segment") was corrected in the API reference, the rustdoc, and
+  `docs/ON_DISK_FORMAT.md`.
+
+### Added
+
+- A property test that soaks `truncate_before` across random record sets, segment
+  sizes, and truncation points, asserting every record from the checkpoint on
+  reads back intact after a reopen; and a torn-head-marker test proving recovery
+  falls back to the full log without data loss.
+
+### Notes
+
+- **On-disk:** the `head` marker grew from 8 to 12 bytes (the trailing CRC32C).
+  It is brand new in 0.9.0 and not part of the frozen record/segment format; an
+  older 8-byte marker is simply ignored on open (safe — the log recovers in full).
+
+---
+
 ## [0.9.0] - 2026-06-05
 
 Prefix compaction — the complement to suffix truncation — so a consumer can
@@ -385,7 +418,8 @@ Initial scaffold and repository bootstrap. No WAL logic yet — this release est
 - `.gitattributes` normalising line endings and excluding development paths from archives.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) — gitignored.
 
-[Unreleased]: https://github.com/jamesgober/wal-db/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/jamesgober/wal-db/compare/v0.9.1...HEAD
+[0.9.1]: https://github.com/jamesgober/wal-db/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/jamesgober/wal-db/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/jamesgober/wal-db/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/jamesgober/wal-db/compare/v0.6.0...v0.7.0

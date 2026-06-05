@@ -194,13 +194,28 @@ A segmented log can also drop its **prefix** — reclaim old, already-applied
 records — by deleting whole leading segment files. Because records span segments,
 the lowest surviving segment may begin in the middle of a record, so recovery
 cannot infer where the first complete record starts. The directory therefore
-holds an optional file named `head`: 8 little-endian bytes giving the byte offset
-of the first surviving record (a real record boundary). It is written and flushed
-*before* any segment is deleted, so a crash mid-truncation still recovers from the
-correct boundary. The file is absent until the first prefix truncation; when
-absent, the head is 0. A reader that does not understand the `head` file ignores
-it (it is not a `.wal` segment), which is safe only for logs that never had a
-prefix dropped.
+holds an optional file named `head`, a 12-byte checksummed marker:
+
+```text
+        +--------------------+--------------------+
+ field  | head offset        | crc32c             |
+ type   | u64 (LE)           | u32 (LE)           |
+ offset | +0                 | +8                 |
+        +--------------------+--------------------+
+```
+
+The `head offset` is the byte offset of the first surviving record — a real
+record boundary — and `crc32c` is the CRC32C of those 8 bytes. The marker is
+written and flushed *before* any segment is deleted, so a crash mid-truncation
+still recovers from the correct boundary. It is absent until the first prefix
+truncation; when absent, the head is 0.
+
+On open, a marker that is missing, short, or whose checksum does not match is
+ignored and the head falls back to 0, so recovery reads the whole log. This is
+always safe: it never skips a live record — at worst a prefix that was meant to be
+dropped is read again. A reader that does not understand the `head` file ignores
+it entirely (it is not a `.wal` segment), which is correct only for logs that
+never had a prefix dropped.
 
 <hr>
 <br>

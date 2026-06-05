@@ -125,7 +125,7 @@ fn truncated_mid_payload_drops_the_partial_record() {
 }
 
 #[test]
-fn a_corrupt_head_marker_does_not_crash_recovery() {
+fn a_torn_head_marker_falls_back_to_full_recovery() {
     let dir = tempfile::tempdir().unwrap();
     {
         let wal = Wal::open_segmented(dir.path(), 32).unwrap();
@@ -135,17 +135,20 @@ fn a_corrupt_head_marker_does_not_crash_recovery() {
         wal.sync().unwrap();
     }
 
-    // A head marker pointing far past the end: clamped to the end on open, so
-    // recovery reads nothing and never over-reads or panics.
-    fs::write(dir.path().join("head"), u64::MAX.to_le_bytes()).unwrap();
+    // A short (torn) head marker — the kind a crash mid-write could leave — has no
+    // valid checksum, so it is ignored: recovery falls back to the head of 0 and
+    // reads every record. Nothing is silently skipped.
+    fs::write(dir.path().join("head"), 3u64.to_le_bytes()).unwrap(); // 8 bytes, no crc
     let wal = Wal::open_segmented(dir.path(), 32).unwrap();
-    let _ = wal.iter().unwrap().count();
+    assert_eq!(wal.iter().unwrap().count(), 10);
 
-    // A head marker landing mid-record: recovery reads a malformed record there
-    // and stops cleanly, again without panicking.
-    fs::write(dir.path().join("head"), 3u64.to_le_bytes()).unwrap();
+    // A full-length marker with a corrupt checksum is rejected the same way, even
+    // though its offset (here, mid-record) looks plausible.
+    let mut corrupt = [0u8; 12];
+    corrupt[..8].copy_from_slice(&3u64.to_le_bytes()); // plausible offset, bogus crc bytes
+    fs::write(dir.path().join("head"), corrupt).unwrap();
     let wal = Wal::open_segmented(dir.path(), 32).unwrap();
-    let _ = wal.iter().unwrap().count();
+    assert_eq!(wal.iter().unwrap().count(), 10);
 }
 
 #[test]

@@ -200,3 +200,47 @@ fn appends_continue_after_truncate_before() {
         .unwrap();
     assert_eq!(last, b"after");
 }
+
+proptest::proptest! {
+    /// Across random record sets, segment sizes, and truncation points, every
+    /// record from the checkpoint onward must read back intact after a reopen —
+    /// even though records span segments and the lowest survivor starts mid-file.
+    #[test]
+    fn truncate_before_never_loses_records_from_the_checkpoint(
+        n_records in 5usize..40,
+        seg_size in 16u64..80,
+        cut_num in 0usize..40,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let cut = cut_num % n_records;
+
+        let mut payloads = Vec::new();
+        let mut lsns = Vec::new();
+        {
+            let wal = Wal::open_segmented(dir.path(), seg_size).unwrap();
+            for i in 0..n_records {
+                let payload = format!("r{i}:{}", "z".repeat(i % 9)).into_bytes();
+                lsns.push(wal.append(&payload).unwrap());
+                payloads.push(payload);
+            }
+            wal.sync().unwrap();
+            let head = wal.truncate_before(lsns[cut]).unwrap();
+            proptest::prop_assert_eq!(head.get(), lsns[cut].get());
+        }
+
+        // Reopen and confirm every record at or after the checkpoint survived
+        // with its original bytes and LSN.
+        let wal = Wal::open_segmented(dir.path(), seg_size).unwrap();
+        let survivors: std::collections::HashMap<u64, Vec<u8>> = wal
+            .iter()
+            .unwrap()
+            .map(|e| {
+                let r = e.unwrap();
+                (r.lsn().get(), r.into_data())
+            })
+            .collect();
+        for i in cut..n_records {
+            proptest::prop_assert_eq!(survivors.get(&lsns[i].get()), Some(&payloads[i]));
+        }
+    }
+}

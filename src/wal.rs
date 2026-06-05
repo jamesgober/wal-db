@@ -571,13 +571,16 @@ impl<S: WalStore> Wal<S> {
     /// reclaimed. Offsets are preserved — surviving records keep their LSNs — so
     /// [`iter`](Wal::iter) and [`iter_from`](Wal::iter_from) continue to work.
     ///
-    /// Removal is at the backend's granularity. A segmented log
-    /// ([`Wal::open_segmented`](Wal::open_segmented)) drops whole leading segment
-    /// files, so the returned head may be *below* `lsn` — at the start of the
-    /// segment that holds it — and the segment with the most recent records is
-    /// never dropped. A single-file log cannot reclaim a prefix without moving the
-    /// surviving bytes (which would change their LSNs), so it is left unchanged and
-    /// the returned head is `Lsn(0)`.
+    /// Reading resumes at exactly `lsn` — the returned head is `lsn` itself
+    /// (clamped so it never moves backward or past the end). *Reclamation*,
+    /// though, is at the backend's granularity: a segmented log
+    /// ([`Wal::open_segmented`](Wal::open_segmented)) deletes whole leading segment
+    /// files below the one that holds `lsn`, so a little space just before `lsn` —
+    /// back to its segment boundary — is kept rather than reclaimed, and the
+    /// segment with the most recent records is never dropped. A single-file log
+    /// cannot reclaim a prefix without moving the surviving bytes (which would
+    /// change their LSNs), so it is left unchanged and the returned head is
+    /// `Lsn(0)`.
     ///
     /// # Exclusive access
     ///

@@ -39,6 +39,8 @@ const NAME_EXT: &str = "wal";
 /// Name of the file that records the log's head (its lowest surviving offset)
 /// after a prefix has been dropped. Absent until the first `truncate_before`.
 const HEAD_FILE: &str = "head";
+/// Size of the head marker: an 8-byte offset plus a 4-byte CRC32C of it.
+const HEAD_FILE_LEN: usize = 12;
 
 /// A [`WalStore`] that stripes one flat byte space across fixed-size segment
 /// files in a directory.
@@ -212,7 +214,16 @@ impl SegmentedStore {
     }
 
     /// Durably record `head` so a later open resumes from the same boundary.
+    ///
+    /// The marker is checksummed (`[head: u64][crc32c(head): u32]`) so a torn
+    /// write of the marker itself is detected on read rather than trusted — a
+    /// corrupt marker must never make recovery skip live records.
     fn write_head_file(&self, head: u64) -> Result<()> {
+        let mut buf = [0u8; HEAD_FILE_LEN];
+        buf[..8].copy_from_slice(&head.to_le_bytes());
+        let crc = crc32c::crc32c(&buf[..8]);
+        buf[8..].copy_from_slice(&crc.to_le_bytes());
+
         let path = self.dir.join(HEAD_FILE);
         let file = OpenOptions::new()
             .write(true)
@@ -220,20 +231,31 @@ impl SegmentedStore {
             .truncate(true)
             .open(&path)
             .map_err(|e| WalError::io("writing the head marker", e))?;
-        pwrite_all(&file, 0, &head.to_le_bytes())
-            .map_err(|e| WalError::io("writing the head marker", e))?;
+        pwrite_all(&file, 0, &buf).map_err(|e| WalError::io("writing the head marker", e))?;
         durable_sync(&file).map_err(|e| WalError::io("flushing the head marker", e))?;
         Ok(())
     }
 }
 
-/// Read the durably recorded head, or `None` if no prefix has been dropped (or
-/// the marker is too short to trust, in which case the head is taken as 0).
+/// Read the durably recorded head, or `None` if no prefix has been dropped.
+///
+/// A marker that is absent, too short, or whose checksum does not match is taken
+/// as `None`, so the head falls back to 0 and recovery reads the whole log. That
+/// is always safe: a dropped prefix that the marker can no longer vouch for is
+/// simply re-read, never skipped.
 fn read_head_file(dir: &Path) -> Result<Option<u64>> {
     match fs::read(dir.join(HEAD_FILE)) {
-        Ok(bytes) if bytes.len() >= 8 => Ok(Some(u64::from_le_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-        ]))),
+        Ok(bytes) if bytes.len() >= HEAD_FILE_LEN => {
+            let head = u64::from_le_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            ]);
+            let stored = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+            if crc32c::crc32c(&bytes[..8]) == stored {
+                Ok(Some(head))
+            } else {
+                Ok(None) // torn or corrupt marker: fall back to full recovery
+            }
+        }
         Ok(_) => Ok(None),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(WalError::io("reading the head marker", error)),

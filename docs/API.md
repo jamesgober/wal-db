@@ -513,13 +513,16 @@ everything up to a checkpoint, the old records can be reclaimed. **Offsets are
 preserved** — surviving records keep their LSNs, so [`iter`](#waliter) and
 [`iter_from`](#waliter_from) keep working.
 
-Removal is at the storage backend's granularity. A **segmented** log
+Reading resumes at exactly `lsn` — the returned head is `lsn` itself (clamped so
+it never moves backward or past the end). *Reclamation* is at the storage
+backend's granularity: a **segmented** log
 ([`Wal::open_segmented`](#walopen_segmented)) deletes whole leading segment files
-and records the new head durably, so a crash recovers from the same boundary; the
-returned head may be below `lsn` (at the start of the segment that holds it), and
-the segment with the most recent records is never dropped. A **single-file** log
-cannot reclaim a prefix without moving the surviving bytes (which would change
-their LSNs), so it is left unchanged and the returned head is `Lsn(0)`.
+below the one that holds `lsn` and records the new head durably (a checksummed
+marker), so a crash recovers from the same boundary; a little space just before
+`lsn` is kept rather than reclaimed, and the segment with the most recent records
+is never dropped. A **single-file** log cannot reclaim a prefix without moving the
+surviving bytes (which would change their LSNs), so it is left unchanged and the
+returned head is `Lsn(0)`.
 
 Like [`truncate_after`](#waltruncate_after), this requires **exclusive access** —
 no concurrent `append`, `sync`, `iter`, or other truncation — because it removes
