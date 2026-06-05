@@ -116,11 +116,39 @@ fn bench_commit_group(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_recovery(c: &mut Criterion) {
+    const RECORDS: u64 = 10_000;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("recover.wal");
+    {
+        let wal = Wal::open(&path).expect("open log");
+        for _ in 0..RECORDS {
+            let _ = wal.append(black_box(PAYLOAD)).expect("append");
+        }
+        wal.sync().expect("sync");
+    }
+
+    let mut group = c.benchmark_group("recovery");
+    group.throughput(Throughput::Elements(RECORDS));
+    group.bench_function("replay/10k", |b| {
+        b.iter(|| {
+            // Reopen (the recovery scan) and replay every record — the full cost
+            // of bringing a log back on startup.
+            let wal = Wal::open(&path).expect("reopen log");
+            let count = wal.iter().expect("iter").filter(Result::is_ok).count();
+            black_box(count);
+        });
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_append_single,
     bench_append_multi,
     bench_commit_single,
-    bench_commit_group
+    bench_commit_group,
+    bench_recovery
 );
 criterion_main!(benches);

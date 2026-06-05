@@ -444,6 +444,118 @@ impl<S: WalStore> Wal<S> {
         })
     }
 
+    /// Iterate from `from` (a record's [`Lsn`]) to the end, skipping the records
+    /// before it.
+    ///
+    /// Because an LSN is a byte offset, seeking is O(1): iteration simply starts
+    /// at `from` instead of 0. Pass an [`Lsn`] that a previous
+    /// [`append`](Wal::append) or [`iter`](Wal::iter) produced — a real record
+    /// boundary. An `Lsn` that does not land on a record boundary will be read as
+    /// a malformed record and surface as [`WalError::Corruption`]; an `Lsn` past
+    /// the end yields an empty iterator.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use wal_db::{MemStore, Wal};
+    /// # fn main() -> Result<(), wal_db::WalError> {
+    /// let wal = Wal::with_store(MemStore::new())?;
+    /// wal.append(b"one")?;
+    /// let second = wal.append(b"two")?;
+    /// wal.append(b"three")?;
+    ///
+    /// let from_second: Vec<Vec<u8>> = wal
+    ///     .iter_from(second)?
+    ///     .map(|entry| entry.map(|r| r.into_data()))
+    ///     .collect::<Result<_, _>>()?;
+    /// assert_eq!(from_second, vec![b"two".to_vec(), b"three".to_vec()]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn iter_from(&self, from: Lsn) -> Result<WalIter<'_, S>> {
+        let end = self.commit.committed();
+        Ok(WalIter {
+            wal: self,
+            offset: from.get().min(end),
+            end,
+            done: false,
+            policy: self.recovery_policy,
+        })
+    }
+
+    /// Drop every record after the one at `lsn`, keeping the log up to and
+    /// including it. For compaction.
+    ///
+    /// The record at `lsn` becomes the new last record; the next append lands
+    /// right after it. The truncation is made durable before returning. `lsn`
+    /// must be a real record boundary from a previous [`append`](Wal::append) or
+    /// [`iter`](Wal::iter), and the record there must be intact.
+    ///
+    /// # Exclusive access
+    ///
+    /// This mutates the log's end, so it must **not** run concurrently with
+    /// [`append`](Wal::append), [`sync`](Wal::sync), or another `truncate_after`.
+    /// The caller is responsible for quiescing writers first — the usual case for
+    /// compaction, where the engine pauses the log, truncates, and resumes.
+    ///
+    /// # Errors
+    ///
+    /// - [`WalError::Corruption`] if `lsn` does not point at an intact record.
+    /// - [`WalError::Io`] if the truncation or its sync fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use wal_db::{MemStore, Wal};
+    /// # fn main() -> Result<(), wal_db::WalError> {
+    /// let wal = Wal::with_store(MemStore::new())?;
+    /// wal.append(b"keep me")?;
+    /// let last_kept = wal.append(b"and me")?;
+    /// wal.append(b"drop me")?;
+    ///
+    /// wal.truncate_after(last_kept)?;
+    ///
+    /// let remaining: Vec<Vec<u8>> = wal
+    ///     .iter()?
+    ///     .map(|entry| entry.map(|r| r.into_data()))
+    ///     .collect::<Result<_, _>>()?;
+    /// assert_eq!(remaining, vec![b"keep me".to_vec(), b"and me".to_vec()]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn truncate_after(&self, lsn: Lsn) -> Result<()> {
+        let start = lsn.get();
+
+        // Confirm an intact record really lives at `lsn` before keeping it.
+        let mut header = [0u8; HEADER_LEN];
+        if self.store.read_at(start, &mut header)? < HEADER_LEN {
+            return Err(WalError::corruption(start, "no record at this LSN"));
+        }
+        let parsed = record::parse_header(&header);
+        if parsed.len > self.max_record_size {
+            return Err(WalError::corruption(start, "no valid record at this LSN"));
+        }
+        let payload_start = start
+            .checked_add(HEADER_LEN as u64)
+            .ok_or_else(|| WalError::corruption(start, "record offset overflow"))?;
+        let mut payload = vec![0u8; parsed.len as usize];
+        if self.store.read_at(payload_start, &mut payload)? < payload.len() {
+            return Err(WalError::corruption(start, "incomplete record at this LSN"));
+        }
+        if !record::verify(&header, &payload, parsed.crc) {
+            return Err(WalError::corruption(start, "no valid record at this LSN"));
+        }
+        let new_end = payload_start
+            .checked_add(u64::from(parsed.len))
+            .ok_or_else(|| WalError::corruption(start, "record offset overflow"))?;
+
+        self.store.truncate(new_end)?;
+        self.store.sync()?;
+        self.tail.0.store(new_end, Ordering::Release);
+        self.commit.reset(new_end);
+        Ok(())
+    }
+
     /// The logical size of the log in bytes, including record framing.
     ///
     /// This is the offset at which the next append will land. It counts bytes
@@ -991,6 +1103,70 @@ mod tests {
         let wal = Wal::with_store(MemStore::new()).unwrap();
         wal.append_and_sync(b"committed").unwrap();
         assert_eq!(drain(&wal), vec![b"committed".to_vec()]);
+    }
+
+    #[test]
+    fn test_iter_from_seeks_to_lsn() {
+        let wal = Wal::with_store(MemStore::new()).unwrap();
+        wal.append(b"a").unwrap();
+        let b = wal.append(b"b").unwrap();
+        wal.append(b"c").unwrap();
+
+        let got: Vec<Vec<u8>> = wal
+            .iter_from(b)
+            .unwrap()
+            .map(|r| r.unwrap().into_data())
+            .collect();
+        assert_eq!(got, vec![b"b".to_vec(), b"c".to_vec()]);
+    }
+
+    #[test]
+    fn test_iter_from_past_end_is_empty() {
+        let wal = Wal::with_store(MemStore::new()).unwrap();
+        wal.append(b"a").unwrap();
+        assert_eq!(wal.iter_from(Lsn::new(9_999)).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn test_truncate_after_drops_later_records() {
+        let wal = Wal::with_store(MemStore::new()).unwrap();
+        wal.append(b"first").unwrap(); // [0, 13)
+        let keep = wal.append(b"second").unwrap(); // [13, 27)
+        wal.append(b"third").unwrap();
+        wal.append(b"fourth").unwrap();
+
+        wal.truncate_after(keep).unwrap();
+        assert_eq!(drain(&wal), vec![b"first".to_vec(), b"second".to_vec()]);
+        assert_eq!(wal.len(), 27);
+
+        // Appends resume immediately after the kept record.
+        assert_eq!(wal.append(b"new").unwrap().get(), 27);
+        assert_eq!(
+            drain(&wal),
+            vec![b"first".to_vec(), b"second".to_vec(), b"new".to_vec()]
+        );
+    }
+
+    #[test]
+    fn test_truncate_after_keeping_last_record_is_a_no_op() {
+        let wal = Wal::with_store(MemStore::new()).unwrap();
+        wal.append(b"first").unwrap();
+        let last = wal.append(b"second").unwrap();
+        let before = wal.len();
+
+        wal.truncate_after(last).unwrap();
+        assert_eq!(wal.len(), before);
+        assert_eq!(drain(&wal), vec![b"first".to_vec(), b"second".to_vec()]);
+    }
+
+    #[test]
+    fn test_truncate_after_invalid_lsn_errors() {
+        let config = WalConfig::new().with_max_record_size(64);
+        let wal = Wal::with_store_and_config(MemStore::new(), config).unwrap();
+        wal.append(b"only record").unwrap();
+        // An LSN that does not land on a record boundary is rejected.
+        let err = wal.truncate_after(Lsn::new(3)).unwrap_err();
+        assert!(matches!(err, WalError::Corruption { .. }));
     }
 
     #[test]

@@ -69,10 +69,9 @@ pub enum WalError {
     /// A typed record could not be encoded or decoded.
     ///
     /// Produced only by the typed-record API (the `pack-io` feature):
-    /// [`Wal::append_typed`](crate::Wal::append_typed) when a value fails to
-    /// serialise, or [`Record::decode`](crate::Record::decode) when a record's
-    /// bytes do not deserialise into the requested type. `detail` carries the
-    /// underlying codec error's message.
+    /// `Wal::append_typed` when a value fails to serialise, or `Record::decode`
+    /// when a record's bytes do not deserialise into the requested type.
+    /// `detail` carries the underlying codec error's message.
     Encoding {
         /// The underlying serialization error, as text.
         detail: String,

@@ -34,6 +34,8 @@
   - [`Wal::append_and_sync`](#walappend_and_sync)
   - [`Wal::append_typed`](#walappend_typed)
   - [`Wal::iter`](#waliter)
+  - [`Wal::iter_from`](#waliter_from)
+  - [`Wal::truncate_after`](#waltruncate_after)
   - [`Wal::len` / `Wal::is_empty`](#wallen--walis_empty)
   - [`Lsn`](#lsn)
   - [`Record`](#record)
@@ -425,6 +427,73 @@ for entry in wal.iter()? {
         Err(e) => return Err(e),
     }
 }
+# Ok(())
+# }
+```
+
+### `Wal::iter_from`
+
+```rust
+pub fn iter_from(&self, from: Lsn) -> Result<WalIter<'_, S>>
+```
+
+Iterate from `from` to the end, skipping the records before it. Because an
+[`Lsn`](#lsn) is a byte offset, the seek is O(1) — iteration just starts at
+`from` instead of 0. Pass an `Lsn` a previous [`append`](#walappend) or
+[`iter`](#waliter) produced (a real record boundary); an `Lsn` that does not land
+on one is read as a malformed record and surfaces as
+[`WalError::Corruption`](#walerror), and an `Lsn` past the end yields an empty
+iterator.
+
+```rust
+use wal_db::{MemStore, Wal};
+
+# fn main() -> Result<(), wal_db::WalError> {
+let wal = Wal::with_store(MemStore::new())?;
+wal.append(b"one")?;
+let second = wal.append(b"two")?;
+wal.append(b"three")?;
+
+let from_second: Vec<Vec<u8>> = wal
+    .iter_from(second)?
+    .map(|entry| entry.map(|r| r.into_data()))
+    .collect::<Result<_, _>>()?;
+assert_eq!(from_second, vec![b"two".to_vec(), b"three".to_vec()]);
+# Ok(())
+# }
+```
+
+### `Wal::truncate_after`
+
+```rust
+pub fn truncate_after(&self, lsn: Lsn) -> Result<()>
+```
+
+Drop every record after the one at `lsn`, keeping the log up to and including it
+— the durable building block of compaction. The record at `lsn` becomes the new
+last record, the next append lands right after it, and the truncation is made
+durable before returning.
+
+**Exclusive access.** This mutates the log's end, so it must **not** run
+concurrently with [`append`](#walappend), [`sync`](#walsync), or another
+`truncate_after`. The caller quiesces writers first — the usual case for
+compaction, where the engine pauses, truncates, and resumes.
+
+**Returns** `Ok(())`, or [`WalError::Corruption`](#walerror) if `lsn` does not
+point at an intact record, or [`WalError::Io`](#walerror) if the truncation or its
+sync fails.
+
+```rust
+use wal_db::{MemStore, Wal};
+
+# fn main() -> Result<(), wal_db::WalError> {
+let wal = Wal::with_store(MemStore::new())?;
+wal.append(b"keep me")?;
+let last_kept = wal.append(b"and me")?;
+wal.append(b"drop me")?;
+
+wal.truncate_after(last_kept)?;
+assert_eq!(wal.iter()?.count(), 2);
 # Ok(())
 # }
 ```

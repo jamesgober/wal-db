@@ -18,6 +18,43 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [0.5.0] - 2026-06-05
+
+Feature complete. LSN seeking and compaction truncation round out what a storage
+engine needs from a WAL, with a recorded benchmark suite. The feature set is now
+frozen; remaining milestones are optimization and hardening.
+
+### Added
+
+- **`Wal::iter_from(lsn)`** — replay from any LSN. Because an LSN is a byte
+  offset, the seek is O(1): iteration starts at the LSN instead of scanning from
+  the beginning.
+- **`Wal::truncate_after(lsn)`** — drop every record after the one at `lsn`,
+  keeping the log up to and including it, for compaction. The truncation is made
+  durable before returning, and works across single-file and segmented logs.
+- A `recovery/replay` benchmark, and **`docs/BENCHMARKS.md`** recording baseline
+  numbers for the append, commit, group-commit, and recovery paths.
+
+### Changed
+
+- CI now runs `clippy`, `test`, and `doc` on **both** the default and
+  `--all-features` configurations (previously only `--all-features`).
+- Feature freeze declared. No async wrapper is shipped — the core stays
+  synchronous and runtime-agnostic by design; the docs show the one-line
+  `spawn_blocking` pattern for async callers.
+
+### Fixed
+
+- `cargo doc` on the default feature set: the always-present `WalError::Encoding`
+  variant linked to the `pack-io`-only `Wal::append_typed` / `Record::decode`,
+  which broke the doc build without the feature. The links are now plain code
+  spans.
+- CI fuzz job: pinned the fuzz build to `x86_64-unknown-linux-gnu`. The prebuilt
+  `cargo-fuzz` is a musl-static binary and otherwise defaulted the fuzz target to
+  musl, where AddressSanitizer cannot link against the statically linked libc.
+
+---
+
 ## [0.4.0] - 2026-06-05
 
 Recovery hardening and optional typed records. A continuous fuzz harness proves
@@ -210,7 +247,8 @@ Initial scaffold and repository bootstrap. No WAL logic yet — this release est
 - `.gitattributes` normalising line endings and excluding development paths from archives.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) — gitignored.
 
-[Unreleased]: https://github.com/jamesgober/wal-db/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/jamesgober/wal-db/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/jamesgober/wal-db/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/wal-db/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/jamesgober/wal-db/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/jamesgober/wal-db/compare/v0.2.0...v0.3.0

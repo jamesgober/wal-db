@@ -32,7 +32,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). Lock-free append. Group commit. Explicit fsync. Crash-safe recovery.
     </p>
     <blockquote>
-        <strong>Status: pre-1.0, in active development.</strong> <code>0.4</code> adds recovery hardening (a continuous fuzz harness, a skip-bad-records policy) and optional typed records via <code>pack-io</code>. On top of segment rotation (<code>0.3.1</code>) and the lock-free multi-writer append, group commit, and <a href="./docs/ON_DISK_FORMAT.md">1.x-frozen on-disk format</a> from <code>0.3.0</code>. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for detail.
+        <strong>Status: pre-1.0, feature-frozen at <code>0.5</code>.</strong> <code>0.5</code> completes the feature set — LSN seeking (<code>iter_from</code>) and truncation for compaction (<code>truncate_after</code>), with recorded <a href="./docs/BENCHMARKS.md">benchmarks</a>. On top of recovery hardening and typed records (<code>0.4</code>), segment rotation (<code>0.3.1</code>), and the lock-free append, group commit, and <a href="./docs/ON_DISK_FORMAT.md">1.x-frozen format</a> (<code>0.3.0</code>). See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for detail.
     </blockquote>
 </div>
 
@@ -51,6 +51,7 @@
 - **Self-healing recovery** — a torn tail from a crash mid-append is truncated on open, leaving a clean boundary
 - **Fuzz-hardened recovery** — arbitrary bytes never panic or over-allocate; a continuous `cargo-fuzz` harness proves it
 - **Recovery policies** — stop at the first damaged record, or skip past it for forensic partial recovery
+- **LSN seeking & truncation** — replay from any LSN (`iter_from`); drop everything after one (`truncate_after`) for compaction
 - **Iterator-based replay** — walk the log forward to rebuild state
 - **Typed records (optional)** — serialise any value via `pack-io` behind a feature; the byte-record API is unchanged when off
 - **Pluggable storage backend** — file-backed by default; injectable for in-memory testing and custom stores
@@ -276,6 +277,43 @@ for entry in wal.iter()? {
 }
 # Ok(())
 # }
+```
+
+<br>
+
+## Seeking and compaction
+
+An LSN is a byte offset, so replaying from a checkpoint is O(1) — `iter_from` starts at the LSN instead of scanning from the beginning. When a consumer has durably applied the log up to some point, `truncate_after` drops everything after that record, the durable building block of compaction:
+
+```rust
+use wal_db::Wal;
+
+# fn main() -> Result<(), wal_db::WalError> {
+# let dir = tempfile::tempdir().map_err(wal_db::WalError::from)?;
+# let path = dir.path().join("app.wal");
+let wal = Wal::open(&path)?;
+let _ = wal.append(b"applied")?;
+let checkpoint = wal.append(b"also applied")?;
+let _ = wal.append(b"not yet applied")?;
+
+// Replay only what came at or after the checkpoint.
+for entry in wal.iter_from(checkpoint)? { let _ = entry?; }
+
+// Or compact: keep up to the checkpoint, drop the rest (made durable).
+wal.truncate_after(checkpoint)?;
+# Ok(())
+# }
+```
+
+<br>
+
+## Async
+
+The core is synchronous on purpose — a WAL's calls map to blocking syscalls (`write`, `fsync`), and a runtime is the consumer's choice, not the library's. From an async context, offload to a blocking pool:
+
+```rust,ignore
+let wal = wal.clone(); // Arc<Wal>
+let lsn = tokio::task::spawn_blocking(move || wal.append_and_sync(b"record")).await??;
 ```
 
 Skipping is never silent — each damaged record is still surfaced as an error — and it only works while a record's length prefix is intact enough to locate the next one.

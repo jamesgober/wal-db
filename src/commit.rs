@@ -101,6 +101,20 @@ impl Commit {
         self.lock().committed
     }
 
+    /// Reset both watermarks to `offset`, discarding any pending out-of-order
+    /// completions and clearing a poison.
+    ///
+    /// Used by truncation, which requires exclusive access: no append or sync may
+    /// be in flight, so there is nothing to race with and no waiter to strand.
+    pub(crate) fn reset(&self, offset: u64) {
+        let mut state = self.lock();
+        state.committed = offset;
+        state.durable = offset;
+        state.pending.clear();
+        state.poison = None;
+        self.cond.notify_all();
+    }
+
     /// Make every byte below `target` durable, coalescing concurrent callers
     /// into a single fsync.
     ///
