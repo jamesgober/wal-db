@@ -1,4 +1,4 @@
-# cargo-deny configuration for rate-net.
+# cargo-deny configuration for wal-db.
 # Schema reference: https://embarkstudios.github.io/cargo-deny/checks/cfg.html
 
 [graph]

@@ -9,7 +9,7 @@
 #╚═══════════════════════════════╝
 [package]
 name    = "wal-db"
-version = "0.1.0"
+version = "0.2.0"
 
 rust-version = "1.85"
 edition = "2024"
@@ -47,15 +47,29 @@ name = "wal_db"
 path = "src/lib.rs"
 
 [features]
-default = ["std"]
-std = []
-# Group commit batching (default-on once 0.3 lands).
-batching = []
-# Optional integration with pack-io for record framing.
-pack-io = ["dep:pack-io"]
+# No optional features in the 0.2 foundation. Typed record framing via
+# `serial-io` arrives as an additive feature in 0.4; group-commit tuning
+# in 0.3. Kept empty here so the default surface stays minimal.
+default = []
 
 [dependencies]
-pack-io = { version = "0.1", optional = true, default-features = false }
+# Domain error type. Portfolio crates standardise on `error-forge` for
+# stable error metadata (kind/retryable/status) instead of thiserror/anyhow.
+# Default features are off — only the `ForgeError` trait is needed.
+error-forge = { version = "1.0", default-features = false }
+# Hardware-accelerated CRC32C (Castagnoli) for torn-write detection. Uses
+# the SSE4.2 `crc32` instruction on x86_64 and the CRC extension on aarch64
+# with a software fallback. Zero dependencies of its own; rolling this by
+# hand would mean re-implementing the same intrinsics with no upside.
+crc32c = "0.6"
+
+# macOS is the one platform where the standard library's fsync is not a
+# durability barrier: `File::sync_all` issues `fsync`, which flushes the
+# page cache to the device but not the device's own write cache. Only
+# `fcntl(F_FULLFSYNC)` does. `libc` is pulled in solely to call it, and
+# solely on macOS.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

@@ -18,21 +18,21 @@
 
 <div align="left">
     <p>
-        <strong>wal-db</strong> is a <b>write-ahead log primitive</b> for Rust storage engines. It is the durability substrate underneath every database, transaction system, and distributed log in the portfolio - <code>lsm-db</code>, <code>txn-db</code>, <code>raft-io</code>, and Hive DB all build on it. The append path is <b>lock-free</b>, the durability guarantees are <b>explicit</b>, and recovery is <b>provable</b> from a torn write or partial flush.
+        <strong>wal-db</strong> is a <b>write-ahead log primitive</b> for Rust storage engines. It is the durability substrate underneath every database, transaction system, and distributed log in the portfolio — <code>lsm-db</code>, <code>txn-db</code>, <code>raft-io</code>, and Hive DB all build on it. The durability guarantees are <b>explicit</b>, recovery is <b>provable</b> from a torn write, and the flush is <b>platform-correct</b> on Linux, macOS, and Windows.
     </p>
     <p>
-        A WAL is the workhorse no database can avoid: every state change is appended to a durable log <em>before</em> it is acknowledged, and the log is the source of truth used to rebuild state after a crash. Most Rust databases ship their WAL privately inside the engine; <code>wal-db</code> publishes it as a clean, composable primitive so multiple storage engines (LSM, B+-tree, document store) can share a single, well-tested implementation.
+        A WAL is the workhorse no database can avoid: every state change is appended to a durable log <em>before</em> it is acknowledged, and the log is the source of truth used to rebuild state after a crash. Most Rust databases ship their WAL privately inside the engine; <code>wal-db</code> publishes it as a clean, composable primitive so multiple storage engines (LSM, B-tree, document store) can share a single, well-tested implementation.
     </p>
     <p>
-        The common-case API is one line - <code>wal.append(&amp;record).await?</code> followed by <code>wal.sync().await?</code> - and that path is the fast path. Group commit, batching, segment rotation, and recovery iteration live in Tier 2.
+        The common case is four calls — <code>open</code>, <code>append</code>, <code>sync</code>, <code>iter</code>. The core is synchronous; async is left to the consumer, where it belongs.
     </p>
     <br>
     <hr>
     <p>
-        <strong>MSRV is 1.85+</strong> (Rust 2024 edition). Lock-free append. Explicit fsync. Crash-safe recovery.
+        <strong>MSRV is 1.85+</strong> (Rust 2024 edition). Explicit fsync. Crash-safe recovery. Cross-platform durability.
     </p>
     <blockquote>
-        <strong>Status: pre-1.0, in active development.</strong> The on-disk format is being designed and frozen across the 0.x series; <code>1.0.0</code> will be the format freeze. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for detail.
+        <strong>Status: pre-1.0, in active development.</strong> <code>0.2</code> is the foundation release — a correct single-writer log with platform-correct durability and torn-write recovery. The lock-free multi-writer append path and group commit land in <code>0.3</code>, at which point the on-disk format freezes. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for detail.
     </blockquote>
 </div>
 
@@ -42,27 +42,29 @@
 <h2>What it does</h2>
 
 - **Append-only durable log** of arbitrary byte records
-- **Lock-free append path** — multiple writers, one log, no global lock
-- **Explicit durability barriers** — `append` is fast; `sync` is the durability point
-- **Group commit** — many appends amortise a single fsync
-- **Segment rotation** — bounded segment size; old segments archived or pruned
-- **Crash-safe recovery** — torn-write detection via checksums; truncate to last good record on replay
-- **Iterator-based replay** — walk the log forward from any position to rebuild state
+- **Explicit durability barriers** — `append` is in-memory-fast; `sync` is the durability point
+- **Platform-correct flush** — `fdatasync` on Linux, `FlushFileBuffers` on Windows, `fcntl(F_FULLFSYNC)` on macOS
+- **Torn-write detection** — a CRC32C checksum per record; recovery stops at the first damaged record
+- **Self-healing recovery** — a torn tail from a crash mid-append is truncated on open, leaving a clean boundary
+- **Iterator-based replay** — walk the log forward to rebuild state
 - **Pluggable storage backend** — file-backed by default; injectable for in-memory testing and custom stores
-
 
 <br>
 
-## Features
+## The durability contract
 
-- **Append-only** — single forward-only write path; no in-place updates
-- **Lock-free** — concurrent appenders coordinate via atomics, not mutexes
-- **Group commit** — N concurrent appends → 1 fsync, dramatically higher throughput
-- **Segmented** — bounded segment files for rotation, archival, pruning
-- **Torn-write detection** — per-record checksums; recovery stops at the last verifiable record
-- **Replay iterator** — fast forward iteration for state recovery
-- **Pluggable backend** — file, in-memory, or custom storage adapter
-- **`pack-io` integration** — optional, for typed record framing
+Two operations, two distinct guarantees. Confusing them is the single most common way to lose data with a WAL, so `wal-db` keeps them explicit:
+
+- **`append`** returns when the record is in the operating system's page cache. A crash after `append` but before `sync` may lose that record.
+- **`sync`** returns only when every record appended before it is on stable storage and will survive a power loss.
+
+That flush is not the same call on every platform, and getting it wrong is silent:
+
+| Platform | Durability call |
+|----------|-----------------|
+| Linux    | `fdatasync` |
+| Windows  | `FlushFileBuffers` |
+| macOS    | `fcntl(F_FULLFSYNC)` — **not** plain `fsync`, which leaves data in the drive's write cache |
 
 <br>
 
@@ -70,10 +72,7 @@
 
 ```toml
 [dependencies]
-wal-db = "0.1"
-
-# With pack-io framing:
-wal-db = { version = "0.1", features = ["pack-io"] }
+wal-db = "0.2"
 ```
 
 <br>
@@ -83,48 +82,124 @@ wal-db = { version = "0.1", features = ["pack-io"] }
 ```rust
 use wal_db::Wal;
 
-let wal = Wal::open("/var/lib/myapp/wal")?;
+# fn apply(_lsn: wal_db::Lsn, _bytes: &[u8]) -> Result<(), wal_db::WalError> { Ok(()) }
+// Open (or create) the log.
+let wal = Wal::open("/var/lib/myapp/app.wal")?;
 
-// The 80% case — append a record, then sync for durability.
-let lsn = wal.append(b"some_record_bytes").await?;
-wal.sync().await?;
+// Append returns once the record is in the OS page cache. It does not flush.
+let lsn = wal.append(b"a state change")?;
 
-// On startup, replay from the beginning to rebuild state.
-for record in wal.iter()? {
-    let (lsn, bytes) = record?;
-    apply(lsn, &bytes)?;
+// Sync is the durability barrier: it returns once the record is on stable storage.
+wal.sync()?;
+
+// On restart, replay the log from the start to rebuild state.
+for entry in wal.iter()? {
+    let entry = entry?;
+    apply(entry.lsn(), entry.data())?;
 }
 ```
 
 <br>
 
-## Group Commit
+## Recovery
 
-Many concurrent appends batched into one fsync:
+Every record carries a CRC32C checksum over its own bytes. On `open`, the log scans forward and stops at the first record that is incomplete or fails its checksum — a torn write left by a crash mid-append — and truncates that tail. The records before it are kept; the next append continues from a clean boundary with no gap in the sequence numbers. A corrupt length prefix can never trigger a wild allocation: lengths are validated against the configured maximum before a single payload byte is read.
 
 ```rust
 use wal_db::Wal;
 
-let wal = Wal::open("/var/lib/myapp/wal")?;
+# fn main() -> Result<(), wal_db::WalError> {
+# let dir = tempfile::tempdir().map_err(wal_db::WalError::from)?;
+# let path = dir.path().join("app.wal");
+// After a crash, reopening the log truncates any torn tail automatically.
+let wal = Wal::open(&path)?;
 
-// N concurrent tasks call append + sync_when_ready;
-// the WAL coalesces them into a single fsync.
-let lsn = wal.append_and_sync(record).await?;
+// Iteration yields a Result per record; a damaged record surfaces once, then ends.
+for entry in wal.iter()? {
+    match entry {
+        Ok(record) => { /* apply record.data() at record.lsn() */ }
+        Err(e) => eprintln!("recovery stopped: {e}"),
+    }
+}
+# Ok(())
+# }
 ```
+
+<br>
+
+## Configuration
+
+Tunables live on `WalConfig`, a builder passed to `Wal::open_with`:
+
+```rust
+use wal_db::{Wal, WalConfig};
+
+# fn main() -> Result<(), wal_db::WalError> {
+# let dir = tempfile::tempdir().map_err(wal_db::WalError::from)?;
+# let path = dir.path().join("app.wal");
+let config = WalConfig::new().with_max_record_size(1024 * 1024); // cap records at 1 MiB
+let wal = Wal::open_with(&path, config)?;
+# let _ = wal;
+# Ok(())
+# }
+```
+
+<br>
+
+## Custom backends
+
+`Wal::open` uses the file-backed `FileStore`. Any type implementing the `WalStore` trait can stand in — an in-memory store for tests, or an alternative storage layer. The crate ships `MemStore` for the in-memory case:
+
+```rust
+use wal_db::{MemStore, Wal};
+
+# fn main() -> Result<(), wal_db::WalError> {
+let wal = Wal::with_store(MemStore::new())?;
+let lsn = wal.append(b"no filesystem involved")?;
+assert_eq!(lsn.get(), 0);
+# Ok(())
+# }
+```
+
+<br>
+
+## Performance
+
+Baseline numbers from the criterion suite (`cargo bench`), single-writer, on the development machine. They are honest starting points, not marketing: the append path in `0.2` is serialised through a mutex, and the lock-free, sub-100ns hot path is the subject of the `0.3` and `0.6` milestones.
+
+| Path | Cost | What it measures |
+|------|------|------------------|
+| `append` (in-memory store) | ~130 ns | framing a 256-byte record and writing it, no I/O |
+| `append` + `sync` (file store) | ~1.1 ms | one record made fully durable, dominated by the disk flush |
+
+Run them yourself:
+
+```bash
+cargo bench --bench wal_bench
+```
+
+<br>
+
+## Examples
+
+| Example | Run | Shows |
+|---------|-----|-------|
+| [`basic`](./examples/basic.rs) | `cargo run --example basic` | the four-call API: open, append, sync, replay |
+| [`recovery`](./examples/recovery.rs) | `cargo run --example recovery` | a simulated torn write and self-healing recovery |
 
 <br>
 
 ## Testing
 
 ```bash
-cargo test --all-features
-RUSTFLAGS="--cfg loom" cargo test --test loom_wal
-cargo bench --bench wal_bench
+cargo test --all-features        # unit, integration, doc tests
+cargo test --test torn_write     # the torn-write recovery property test
+cargo test --test durability     # durability across a real process restart
+cargo bench --bench wal_bench    # append and sync baselines
 ```
 
 <hr>
 <br>
-
 
 ## Where It Fits
 
@@ -141,14 +216,13 @@ It stays foreign-compatible: usable standalone in any project that needs a durab
 ## Cross-Platform Support
 
 **Tier 1 Support:**
-- ✅ Linux (x86_64, aarch64) — uses `fdatasync` where supported
-- ✅ macOS (x86_64, Apple Silicon) — uses `fcntl(F_FULLFSYNC)` for true durability
-- ✅ Windows (x86_64) — uses `FlushFileBuffers`
+- Linux (x86_64, aarch64) — `fdatasync`
+- macOS (x86_64, Apple Silicon) — `fcntl(F_FULLFSYNC)` for true durability
+- Windows (x86_64) — `FlushFileBuffers`
 
-Durability semantics are equivalent across platforms; the CI matrix verifies behavior on each.
+Durability semantics are equivalent across platforms; the CI matrix runs the full suite — including the cross-process durability test — on each.
 
 <br>
-
 
 ## Contributing
 
