@@ -258,14 +258,20 @@ impl WalStore for SegmentedStore {
             let Some(index) = parse_segment_name(&entry.file_name()) else {
                 continue;
             };
-            if index > last_index {
-                fs::remove_file(entry.path())
-                    .map_err(|e| WalError::io("removing a truncated segment", e))?;
-                let _ = self.write_map().remove(&index);
-            } else if index == last_index {
-                let file = self.segment_for_write(index)?;
-                file.set_len(last_local)
-                    .map_err(|e| WalError::io("truncating a log segment", e))?;
+            match index.cmp(&last_index) {
+                std::cmp::Ordering::Greater => {
+                    // Entirely past the new end: drop the segment.
+                    fs::remove_file(entry.path())
+                        .map_err(|e| WalError::io("removing a truncated segment", e))?;
+                    let _ = self.write_map().remove(&index);
+                }
+                std::cmp::Ordering::Equal => {
+                    // Straddles the new end: shrink it to the kept bytes.
+                    let file = self.segment_for_write(index)?;
+                    file.set_len(last_local)
+                        .map_err(|e| WalError::io("truncating a log segment", e))?;
+                }
+                std::cmp::Ordering::Less => {}
             }
         }
 
