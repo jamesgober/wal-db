@@ -34,7 +34,7 @@ Criterion writes full reports (with plots) to `target/criterion/`. Each run also
 compares against the last, so a regression beyond the tracked threshold is
 visible immediately.
 
-## Baseline — 0.6.0
+## Baseline — 1.0.0
 
 Measured on a Windows x86_64 development machine, release build, with 256-byte
 records. Medians shown; see `target/criterion/` for the full distributions.

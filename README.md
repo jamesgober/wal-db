@@ -32,7 +32,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). Lock-free append. Group commit. Explicit fsync. Crash-safe recovery.
     </p>
     <blockquote>
-        <strong>Status: pre-1.0, API stable.</strong> Full feature set — lock-free, group-committing, with suffix and prefix compaction and a <a href="./docs/ON_DISK_FORMAT.md">1.x-frozen on-disk format</a>. Hardened with a fuzz harness, loom model checks, adversarial recovery tests, and injected I/O-failure tests; measured against a hand-rolled WAL (<a href="./docs/BENCHMARKS.md">benchmarks</a>). The remaining road to <code>1.0</code> is consumer integration and a stability soak. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for detail.
+        <strong>Status: <code>1.0</code> — stable.</strong> The public API is frozen until <code>2.0</code> and the <a href="./docs/ON_DISK_FORMAT.md">on-disk format</a> is frozen for the 1.x line. Full feature set — lock-free append, group commit, segment rotation, suffix and prefix compaction — hardened with a fuzz harness, loom model checks, adversarial recovery tests, injected I/O-failure tests, and property tests, and measured against a hand-rolled WAL (<a href="./docs/BENCHMARKS.md">benchmarks</a>). See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for detail.
     </blockquote>
 </div>
 
@@ -79,7 +79,7 @@ That flush is not the same call on every platform, and getting it wrong is silen
 
 ```toml
 [dependencies]
-wal-db = "0.9"
+wal-db = "1.0"
 ```
 
 <br>
@@ -233,7 +233,7 @@ By default a record is bytes. With the `pack-io` feature, a record can be any ty
 
 ```toml
 [dependencies]
-wal-db = { version = "0.9", features = ["pack-io"] }
+wal-db = { version = "1.0", features = ["pack-io"] }
 ```
 
 ```rust

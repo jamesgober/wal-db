@@ -18,6 +18,36 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [1.0.0] - 2026-06-05
+
+First stable release. The public API is now frozen until 2.0, and the on-disk
+format is frozen for the 1.x line.
+
+There are no functional changes since 0.9.1 — 1.0.0 is the stability commitment to
+the surface built across the 0.x series:
+
+- Lock-free multi-writer append, with the byte-offset LSN model.
+- Group commit — concurrent syncs coalesce into one fsync.
+- Platform-correct durability (`fdatasync` / `FlushFileBuffers` / `F_FULLFSYNC`).
+- CRC32C torn-write detection and self-healing recovery, with selectable recovery
+  policies.
+- Segment rotation, LSN seeking (`iter_from`), and suffix and prefix compaction
+  (`truncate_after` / `truncate_before`).
+- Optional typed records via `pack-io`, and a pluggable `WalStore` backend.
+
+Hardened with a continuous fuzz harness, loom model checks, adversarial-input and
+fault-injection tests, and property tests; benchmarked against a hand-rolled WAL.
+
+### Stability
+
+- **API:** frozen until 2.0. `WalError` and `RecoveryPolicy` are
+  `#[non_exhaustive]` and `WalConfig` is a builder, so the surface can still grow
+  additively within 1.x.
+- **On-disk format:** record framing and segment layout are frozen for 1.x; see
+  `docs/ON_DISK_FORMAT.md`.
+
+---
+
 ## [0.9.1] - 2026-06-05
 
 Release-candidate hardening of the 0.9.0 prefix-compaction feature, ahead of 1.0.
@@ -418,7 +448,8 @@ Initial scaffold and repository bootstrap. No WAL logic yet — this release est
 - `.gitattributes` normalising line endings and excluding development paths from archives.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) — gitignored.
 
-[Unreleased]: https://github.com/jamesgober/wal-db/compare/v0.9.1...HEAD
+[Unreleased]: https://github.com/jamesgober/wal-db/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/jamesgober/wal-db/compare/v0.9.1...v1.0.0
 [0.9.1]: https://github.com/jamesgober/wal-db/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/jamesgober/wal-db/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/jamesgober/wal-db/compare/v0.7.0...v0.8.0

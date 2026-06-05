@@ -18,8 +18,8 @@
 
 > Complete reference for every public item in `wal-db`, with runnable examples.
 >
-> **Status: API frozen for the 1.x line.** Every item below is stable; the on-disk
-> format is frozen (records in 0.3.0, segment layout in 0.3.1). See
+> **Status: stable (`1.0`).** Every item below is frozen until `2.0`; the on-disk
+> format is frozen for the 1.x line. See
 > [`docs/ON_DISK_FORMAT.md`](./ON_DISK_FORMAT.md).
 
 <a id="top"></a>
@@ -89,10 +89,10 @@ iterator-based and stops at the first torn or corrupt record.
 
 ```toml
 [dependencies]
-wal-db = "0.9"
+wal-db = "1.0"
 
 # Typed records via pack-io:
-wal-db = { version = "0.9", features = ["pack-io"] }
+wal-db = { version = "1.0", features = ["pack-io"] }
 ```
 
 The default feature set is empty; the crate is standard-library only.
