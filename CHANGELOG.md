@@ -1,11 +1,8 @@
-<h1 align="center">
-    <img width="90px" height="auto" src="https://raw.githubusercontent.com/jamesgober/jamesgober/main/media/icons/hexagon-3.svg" alt="Triple Hexagon">
-    <br><b>CHANGELOG</b>
-</h1>
-<p>
-  All notable changes to <code>wal-db</code> will be documented in this file. The format is based on <a href="https://keepachangelog.com/en/1.1.0/">Keep a Changelog</a>,
-  and this project adheres to <a href="https://semver.org/spec/v2.0.0.html/">Semantic Versioning</a>.
-</p>
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
@@ -18,6 +15,60 @@
 ### Fixed
 
 ### Security
+
+---
+
+## [0.3.0] - 2026-06-05
+
+The concurrency core: lock-free multi-writer append, group commit, and a record
+format frozen for the 1.x line. Built for many writers under an `Arc`, with the
+durability and torn-write recovery from 0.2 underneath. Segment rotation follows
+in 0.3.1.
+
+### Added
+
+- **Lock-free multi-writer append.** Each `append` reserves its byte range with a
+  single atomic step and writes its record without a global lock, concurrently
+  with other writers. Steady-state framing is allocation-free (a reused
+  thread-local buffer).
+- **Group commit.** Concurrent `sync` calls coalesce into a single fsync. A short
+  mutex+condvar coordinator tracks the contiguous-written watermark and elects one
+  fsync leader; the expensive work runs outside the lock.
+- `Wal::append_and_sync` — append plus a group-commit-aware sync in one call.
+- **Fail-stop data integrity.** A failed record write poisons the log from that
+  offset on: recovery stops at the gap, and syncs covering it return
+  `WalError::Corruption` rather than silently dropping data.
+- `MemStore::from_bytes` — preload an in-memory store with an existing log image.
+- `docs/ON_DISK_FORMAT.md` — the normative record-format specification, with the
+  exact CRC32C parameters and the recovery algorithm.
+- `tests/loom_wal.rs` — model-checked concurrency: the lock-free reservation
+  (no overlap, no reorder, no loss) and group commit (at most one fsync per
+  syncer, every record durable), verified under `loom`.
+- Throughput benchmarks for single- and multi-writer append and for group-commit
+  commit rate.
+
+### Changed
+
+- **Breaking — LSNs are byte offsets.** `Lsn` is now a record's byte position in
+  the log: monotonic and unique, but no longer consecutive. The first record is
+  `0`; the next sits at its end. This is what makes the append path lock-free and
+  reorder-free. Code that assumed dense `0, 1, 2, …` LSNs must adjust.
+- **Breaking — `WalStore` trait.** Methods now take `&self` (the multi-writer path
+  writes concurrently), `append(&mut self, bytes)` became
+  `write_at(&self, offset, bytes)`, and the trait requires `Send + Sync`.
+- **Breaking — `Wal::len` and `Wal::is_empty`** return `u64` and `bool` directly
+  (a single atomic load) instead of `Result`.
+- **Breaking — on-disk record format.** The header is now 8 bytes (CRC32C + length)
+  instead of 16; the redundant stored LSN is gone, since a record's LSN is its
+  offset. Logs written by 0.2 are not readable by 0.3. **This format is frozen for
+  the 1.x line.**
+- The single-writer append path is faster: the 0.2 internal mutex is gone.
+
+### Notes
+
+- Segment rotation moved to 0.3.1 (recorded in the roadmap). The byte-offset LSN
+  design here is forward-compatible with it. The record format is frozen; the
+  multi-file segment layout finalizes in 0.3.1.
 
 ---
 
@@ -103,6 +154,7 @@ Initial scaffold and repository bootstrap. No WAL logic yet — this release est
 - `.gitattributes` normalising line endings and excluding development paths from archives.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) — gitignored.
 
-[Unreleased]: https://github.com/jamesgober/wal-db/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/jamesgober/wal-db/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/jamesgober/wal-db/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/wal-db/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/wal-db/releases/tag/v0.1.0

@@ -18,7 +18,7 @@
 
 <div align="left">
     <p>
-        <strong>wal-db</strong> is a <b>write-ahead log primitive</b> for Rust storage engines. It is the durability substrate underneath every database, transaction system, and distributed log in the portfolio — <code>lsm-db</code>, <code>txn-db</code>, <code>raft-io</code>, and Hive DB all build on it. The durability guarantees are <b>explicit</b>, recovery is <b>provable</b> from a torn write, and the flush is <b>platform-correct</b> on Linux, macOS, and Windows.
+        <strong>wal-db</strong> is a <b>write-ahead log primitive</b> for Rust storage engines. It is the durability substrate underneath every database, transaction system, and distributed log in the portfolio — <code>lsm-db</code>, <code>txn-db</code>, <code>raft-io</code>, and Hive DB all build on it. The append path is <b>lock-free</b>, durability is <b>explicit</b> and <b>platform-correct</b> on Linux, macOS, and Windows, recovery is <b>provable</b> from a torn write, and concurrent commits <b>coalesce into a single fsync</b>.
     </p>
     <p>
         A WAL is the workhorse no database can avoid: every state change is appended to a durable log <em>before</em> it is acknowledged, and the log is the source of truth used to rebuild state after a crash. Most Rust databases ship their WAL privately inside the engine; <code>wal-db</code> publishes it as a clean, composable primitive so multiple storage engines (LSM, B-tree, document store) can share a single, well-tested implementation.
@@ -29,10 +29,10 @@
     <br>
     <hr>
     <p>
-        <strong>MSRV is 1.85+</strong> (Rust 2024 edition). Explicit fsync. Crash-safe recovery. Cross-platform durability.
+        <strong>MSRV is 1.85+</strong> (Rust 2024 edition). Lock-free append. Group commit. Explicit fsync. Crash-safe recovery.
     </p>
     <blockquote>
-        <strong>Status: pre-1.0, in active development.</strong> <code>0.2</code> is the foundation release — a correct single-writer log with platform-correct durability and torn-write recovery. The lock-free multi-writer append path and group commit land in <code>0.3</code>, at which point the on-disk format freezes. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for detail.
+        <strong>Status: pre-1.0, in active development.</strong> <code>0.3</code> is the concurrency core — lock-free multi-writer append, group commit, and a record format <a href="./docs/ON_DISK_FORMAT.md">frozen for 1.x</a>, on the platform-correct durability and torn-write recovery from <code>0.2</code>. Segment rotation follows in <code>0.3.1</code>. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for detail.
     </blockquote>
 </div>
 
@@ -42,6 +42,8 @@
 <h2>What it does</h2>
 
 - **Append-only durable log** of arbitrary byte records
+- **Lock-free multi-writer append** — many threads append at once with no global lock
+- **Group commit** — concurrent `sync` calls coalesce into one fsync, amortising the durability cost
 - **Explicit durability barriers** — `append` is in-memory-fast; `sync` is the durability point
 - **Platform-correct flush** — `fdatasync` on Linux, `FlushFileBuffers` on Windows, `fcntl(F_FULLFSYNC)` on macOS
 - **Torn-write detection** — a CRC32C checksum per record; recovery stops at the first damaged record
@@ -72,7 +74,7 @@ That flush is not the same call on every platform, and getting it wrong is silen
 
 ```toml
 [dependencies]
-wal-db = "0.2"
+wal-db = "0.3"
 ```
 
 <br>
@@ -146,6 +148,44 @@ let wal = Wal::open_with(&path, config)?;
 
 <br>
 
+## Concurrency and group commit
+
+`Wal` is built for many writers. `append` is lock-free: each call reserves its byte range with a single atomic step — that range's start offset *is* the record's LSN — then writes its record without blocking the others. Share one `Wal` behind an `Arc` and append from every thread.
+
+Durability is where threads cooperate. When several call `sync` at once they coalesce into a single fsync — **group commit** — so the cost of making data durable is amortised across everyone committing together rather than paid N times. `append_and_sync` does an append and a group-commit-aware sync in one call:
+
+```rust
+use std::sync::Arc;
+use std::thread;
+use wal_db::{MemStore, Wal};
+
+# fn main() -> Result<(), wal_db::WalError> {
+let wal = Arc::new(Wal::with_store(MemStore::new())?);
+
+let workers: Vec<_> = (0..4)
+    .map(|t| {
+        let wal = Arc::clone(&wal);
+        thread::spawn(move || {
+            for i in 0..100 {
+                // Each thread appends and commits; the fsyncs coalesce.
+                wal.append_and_sync(format!("worker {t} record {i}").as_bytes()).unwrap();
+            }
+        })
+    })
+    .collect();
+for w in workers {
+    w.join().unwrap();
+}
+
+assert_eq!(wal.iter()?.count(), 400);
+# Ok(())
+# }
+```
+
+> **LSNs are byte offsets.** The LSN returned by `append` is the record's position in the log — monotonic and unique, but not consecutive. The first record is `0`; the next sits at its end. This is what lets the append path reserve with a single atomic and never reorder. See [`docs/ON_DISK_FORMAT.md`](./docs/ON_DISK_FORMAT.md).
+
+<br>
+
 ## Custom backends
 
 `Wal::open` uses the file-backed `FileStore`. Any type implementing the `WalStore` trait can stand in — an in-memory store for tests, or an alternative storage layer. The crate ships `MemStore` for the in-memory case:
@@ -165,12 +205,14 @@ assert_eq!(lsn.get(), 0);
 
 ## Performance
 
-Baseline numbers from the criterion suite (`cargo bench`), single-writer, on the development machine. They are honest starting points, not marketing: the append path in `0.2` is serialised through a mutex, and the lock-free, sub-100ns hot path is the subject of the `0.3` and `0.6` milestones.
+Numbers from the criterion suite (`cargo bench`) on the development machine, with 256-byte records. They are honest measurements, not marketing — the group-commit figure in particular is bounded by this machine's fsync latency and scales with faster storage and more concurrent writers.
 
-| Path | Cost | What it measures |
-|------|------|------------------|
-| `append` (in-memory store) | ~130 ns | framing a 256-byte record and writing it, no I/O |
-| `append` + `sync` (file store) | ~1.1 ms | one record made fully durable, dominated by the disk flush |
+| Benchmark | Result | What it measures |
+|-----------|--------|------------------|
+| `append/single` | ~107 ns | the lock-free hot path: framing one record into memory, no I/O |
+| `append/multi` (8 writers) | ~3.6 M appends/s | many writers appending at once |
+| `commit/single` | ~0.9 ms | one writer, append + fsync each time (unbatched durability) |
+| `commit/group` (8 writers) | ~4× the single rate | concurrent append-and-sync, fsyncs coalesced by group commit |
 
 Run them yourself:
 
@@ -192,11 +234,14 @@ cargo bench --bench wal_bench
 ## Testing
 
 ```bash
-cargo test --all-features        # unit, integration, doc tests
-cargo test --test torn_write     # the torn-write recovery property test
-cargo test --test durability     # durability across a real process restart
-cargo bench --bench wal_bench    # append and sync baselines
+cargo test --all-features                       # unit, integration, doc tests
+cargo test --test torn_write                    # torn-write recovery property test
+cargo test --test durability                    # durability across a real process restart
+RUSTFLAGS="--cfg loom" cargo test --test loom_wal  # model-checked concurrency
+cargo bench --bench wal_bench                    # append and commit throughput
 ```
+
+The `loom` run model-checks the lock-free append and the group-commit handshake: it explores every meaningful thread interleaving and asserts no overlapping records, no reorder, and at most one fsync per syncer.
 
 <hr>
 <br>

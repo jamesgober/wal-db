@@ -5,6 +5,11 @@
 
 use wal_db::Wal;
 
+/// The framed size of a record: an 8-byte header plus the payload.
+fn framed(payload_len: usize) -> u64 {
+    (8 + payload_len) as u64
+}
+
 #[test]
 fn append_sync_reopen_reads_back_all_records() {
     let dir = tempfile::tempdir().unwrap();
@@ -14,10 +19,14 @@ fn append_sync_reopen_reads_back_all_records() {
         .map(|i| format!("record number {i}").into_bytes())
         .collect();
 
+    let mut expected_offset = 0u64;
     {
         let wal = Wal::open(&path).unwrap();
-        for (i, record) in records.iter().enumerate() {
-            assert_eq!(wal.append(record).unwrap().get(), i as u64);
+        for record in &records {
+            // The LSN is the record's byte offset; offsets advance by framed size.
+            let lsn = wal.append(record).unwrap();
+            assert_eq!(lsn.get(), expected_offset);
+            expected_offset += framed(record.len());
         }
         wal.sync().unwrap();
     } // dropping the Wal closes the file handle
@@ -30,8 +39,9 @@ fn append_sync_reopen_reads_back_all_records() {
         .collect();
 
     assert_eq!(read_back, records);
-    // Appends resume at the next sequence number with no gap.
-    assert_eq!(wal.append(b"one more").unwrap().get(), records.len() as u64);
+    assert_eq!(wal.len(), expected_offset);
+    // Appends resume at the recovered end with no gap.
+    assert_eq!(wal.append(b"one more").unwrap().get(), expected_offset);
 }
 
 #[test]
@@ -71,22 +81,19 @@ fn reopening_a_fresh_path_is_empty() {
     let path = dir.path().join("empty.wal");
 
     let wal = Wal::open(&path).unwrap();
-    assert!(wal.is_empty().unwrap());
+    assert!(wal.is_empty());
     assert_eq!(wal.iter().unwrap().count(), 0);
 }
 
 #[test]
-fn lsns_survive_multiple_reopen_cycles() {
+fn records_survive_multiple_reopen_cycles() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("cycles.wal");
 
-    let mut expected_next = 0u64;
     for batch in 0..5 {
         let wal = Wal::open(&path).unwrap();
         for _ in 0..10 {
-            let payload = format!("batch {batch}").into_bytes();
-            assert_eq!(wal.append(&payload).unwrap().get(), expected_next);
-            expected_next += 1;
+            let _ = wal.append(format!("batch {batch}").as_bytes()).unwrap();
         }
         wal.sync().unwrap();
     }

@@ -31,6 +31,7 @@
   - [`Wal::open`](#walopen)
   - [`Wal::append`](#walappend)
   - [`Wal::sync`](#walsync)
+  - [`Wal::append_and_sync`](#walappend_and_sync)
   - [`Wal::iter`](#waliter)
   - [`Wal::len` / `Wal::is_empty`](#wallen--walis_empty)
   - [`Lsn`](#lsn)
@@ -80,7 +81,7 @@ iterator-based and stops at the first torn or corrupt record.
 
 ```toml
 [dependencies]
-wal-db = "0.2"
+wal-db = "0.3"
 ```
 
 The default feature set is empty; the crate is standard-library only.
@@ -98,8 +99,12 @@ Source: `src/wal.rs`
 so the plain name `Wal` is the file-backed log and nothing in Tier 1 requires
 naming a type parameter.
 
-`Wal` is `Send` and `Sync` whenever its store is `Send` (both `FileStore` and
-`MemStore` are), so it can be shared across threads behind an `Arc`.
+`Wal` is `Send` and `Sync`, and the append path is lock-free: many threads can
+share one `Wal` behind an `Arc` and call `append` at once with no global lock.
+Each `append` reserves its byte range with a single atomic step — that range's
+start offset is the record's [`Lsn`](#lsn) — so reservations never overlap or
+reorder. Concurrent [`sync`](#walsync) calls coalesce into one fsync (group
+commit).
 
 ### `Wal::open`
 
@@ -159,14 +164,14 @@ println!("recovered {recovered} records");
 pub fn append(&self, record: &[u8]) -> Result<Lsn>
 ```
 
-Append `record` to the log and return the [`Lsn`](#lsn) it was assigned.
+Append `record` to the log and return the [`Lsn`](#lsn) it was assigned — the
+byte offset where the record begins.
 
-Returns once the bytes are in the operating system's page cache. It does **not**
-flush the disk — call [`sync`](#walsync) for that. A crash between `append` and
-`sync` may lose the record.
-
-Takes `&self`: appends are coordinated internally, so a `Wal` behind a shared
-reference can be appended to without external locking.
+Lock-free: the byte range is reserved with one atomic step and the record is
+written without blocking other appenders. Returns once the bytes are in the
+operating system's page cache. It does **not** flush the disk — call
+[`sync`](#walsync) for that. A crash between `append` and `sync` may lose the
+record.
 
 **Parameters**
 
@@ -176,13 +181,14 @@ reference can be appended to without external locking.
 **Returns** the assigned `Lsn`, or:
 
 - [`WalError::RecordTooLarge`](#walerror) if the record exceeds the limit. The
-  log is unchanged and no sequence number is consumed.
-- [`WalError::Io`](#walerror) if the write fails. After an I/O error the log
-  should be reopened before further use; recovery will discard any partial tail.
+  log is unchanged.
+- [`WalError::Io`](#walerror) if the write fails. The reserved range becomes a
+  permanent gap: the log is durable only up to that point, recovery stops there,
+  and later syncs covering it report the truncation.
 
 **Examples**
 
-Append and capture the sequence number:
+Append and capture the LSN (a byte offset):
 
 ```rust
 use wal_db::{MemStore, Wal};
@@ -191,8 +197,9 @@ use wal_db::{MemStore, Wal};
 let wal = Wal::with_store(MemStore::new())?;
 let lsn = wal.append(b"a state change")?;
 assert_eq!(lsn.get(), 0);
-let next = wal.append(b"another")?;
-assert_eq!(next.get(), 1);
+// The next record sits at the first one's end (8-byte header + 14-byte payload).
+let next = wal.append(b"another record")?;
+assert_eq!(next.get(), 22);
 # Ok(())
 # }
 ```
@@ -226,13 +233,16 @@ Make every record appended before this call durable. Returns once the data is on
 stable storage, using the platform's true durability barrier — `fdatasync` on
 Linux, `FlushFileBuffers` on Windows, `fcntl(F_FULLFSYNC)` on macOS.
 
-This is the only call that survives a power loss, and the expensive one, which
-is why it is separate from `append`. Amortise it by appending several records and
-syncing once.
+This is the only call that survives a power loss, and the expensive one, which is
+why it is separate from `append`. Concurrent `sync` calls coalesce into a single
+fsync — **group commit** — so the flush cost is shared by everyone committing at
+the same moment. Amortise it further by appending several records and syncing
+once.
 
-**Returns** `Ok(())`, or [`WalError::Io`](#walerror) if the flush fails. A failed
-sync means the records are **not** durable; treat it as fatal, not as something
-to retry blindly.
+**Returns** `Ok(())`, or [`WalError::Io`](#walerror) if the flush fails, or
+[`WalError::Corruption`](#walerror) if an earlier append's write failed and left a
+gap that cannot be made durable. A failed sync means the records are **not**
+durable; treat it as fatal, not as something to retry blindly.
 
 **Examples**
 
@@ -249,6 +259,49 @@ for i in 0..100u32 {
     wal.append(&i.to_le_bytes())?;
 }
 wal.sync()?; // one flush makes all 100 durable
+# Ok(())
+# }
+```
+
+### `Wal::append_and_sync`
+
+```rust
+pub fn append_and_sync(&self, record: &[u8]) -> Result<Lsn>
+```
+
+Append `record` and make it durable in one call, returning its [`Lsn`](#lsn).
+Equivalent to [`append`](#walappend) followed by a [`sync`](#walsync) scoped to
+this record, but with the sync coalesced into the group commit of any other
+threads syncing at the same moment. Use it when every record must be durable
+before you proceed and you want group-commit throughput without managing the two
+calls yourself.
+
+**Returns** the assigned `Lsn`, or the union of [`append`](#walappend)'s and
+[`sync`](#walsync)'s errors.
+
+**Examples**
+
+```rust
+use std::sync::Arc;
+use std::thread;
+use wal_db::{MemStore, Wal};
+
+# fn main() -> Result<(), wal_db::WalError> {
+let wal = Arc::new(Wal::with_store(MemStore::new())?);
+let workers: Vec<_> = (0..4)
+    .map(|t| {
+        let wal = Arc::clone(&wal);
+        thread::spawn(move || {
+            for i in 0..25 {
+                wal.append_and_sync(format!("{t}:{i}").as_bytes()).unwrap();
+            }
+        })
+    })
+    .collect();
+for w in workers {
+    w.join().unwrap();
+}
+assert_eq!(wal.iter()?.count(), 100);
 # Ok(())
 # }
 ```
@@ -339,24 +392,24 @@ for entry in wal.iter()? {
 ### `Wal::len` / `Wal::is_empty`
 
 ```rust
-pub fn len(&self) -> Result<u64>
-pub fn is_empty(&self) -> Result<bool>
+pub fn len(&self) -> u64
+pub fn is_empty(&self) -> bool
 ```
 
-`len` is the size of the log in bytes, including per-record framing —
-equivalently, the offset at which the next append will land. `is_empty` reports
-whether the log holds no records. Both return [`WalError::Io`](#walerror) if the
-store cannot report its length.
+`len` is the logical size of the log in bytes, including per-record framing —
+equivalently, the offset at which the next append will land. It is a single
+atomic load, so it is infallible. `is_empty` reports whether the log holds no
+records.
 
 ```rust
 use wal_db::{MemStore, Wal};
 
 # fn main() -> Result<(), wal_db::WalError> {
 let wal = Wal::with_store(MemStore::new())?;
-assert!(wal.is_empty()?);
+assert!(wal.is_empty());
 wal.append(b"data")?;
-assert!(!wal.is_empty()?);
-assert!(wal.len()? > 0);
+assert!(!wal.is_empty());
+assert!(wal.len() > 0);
 # Ok(())
 # }
 ```
@@ -374,20 +427,22 @@ impl Lsn {
 }
 ```
 
-A log sequence number: the position of a record in the log, assigned at append
-time. LSNs are dense and monotonic — the first record is `Lsn(0)`, the next
-`Lsn(1)`, with no gaps. `Lsn` is `Copy`, totally ordered, and `Display`s as its
+A log sequence number: a record's **byte offset** in the log, assigned at append
+time. LSNs are monotonic and unique but **not consecutive** — the first record is
+`Lsn(0)`, and the next sits at its end, larger by the first record's framed size.
+Defining the LSN as the offset is what lets the append path reserve with a single
+atomic and never reorder. `Lsn` is `Copy`, totally ordered, and `Display`s as its
 number. `u64::from(lsn)` and `Lsn::new` convert in each direction.
 
 ```rust
 use wal_db::Lsn;
 
-let a = Lsn::new(0);
-let b = Lsn::new(1);
-assert!(a < b);
-assert_eq!(b.get(), 1);
-assert_eq!(u64::from(b), 1);
-assert_eq!(a.to_string(), "0");
+let first = Lsn::new(0);
+let later = Lsn::new(64); // a later record, at some higher offset
+assert!(first < later);
+assert_eq!(later.get(), 64);
+assert_eq!(u64::from(later), 64);
+assert_eq!(first.to_string(), "0");
 ```
 
 ### `Record`
@@ -406,9 +461,9 @@ impl Record {
 }
 ```
 
-One record read back during iteration: its [`Lsn`](#lsn) and its payload bytes.
-Yielded by [`Wal::iter`](#waliter). Borrow the payload with `data`, or take
-ownership of it without copying via `into_data`.
+One record read back during iteration: its [`Lsn`](#lsn) (its byte offset) and
+its payload bytes. Yielded by [`Wal::iter`](#waliter). Borrow the payload with
+`data`, or take ownership of it without copying via `into_data`.
 
 ```rust
 use wal_db::{MemStore, Wal};
@@ -469,8 +524,8 @@ impl WalConfig {
 A builder for log tunables. Construct with `new` (or `Default`), set parameters
 with the `with_*` methods, and pass it to [`Wal::open_with`](#walopen_with) or
 [`Wal::with_store_and_config`](#walwith_store--walwith_store_and_config). The
-builder shape means new parameters added in later milestones (sync policy,
-segment size, group-commit window) will not break existing call sites.
+builder shape means new parameters added in later milestones (segment size in
+0.3.1, sync policy) will not break existing call sites.
 
 **`max_record_size`** — the largest record the log will accept, in bytes
 (default 64 MiB). [`append`](#walappend) rejects anything larger, and recovery
@@ -521,57 +576,66 @@ let wal = Wal::open_with(&path, config)?;
 Source: `src/store.rs`
 
 ```rust
-pub trait WalStore {
-    fn append(&mut self, bytes: &[u8]) -> Result<()>;
+pub trait WalStore: Send + Sync {
+    fn write_at(&self, offset: u64, bytes: &[u8]) -> Result<()>;
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize>;
-    fn truncate(&mut self, len: u64) -> Result<()>;
-    fn sync(&mut self) -> Result<()>;
+    fn truncate(&self, len: u64) -> Result<()>;
+    fn sync(&self) -> Result<()>;
     fn len(&self) -> Result<u64>;
     fn is_empty(&self) -> Result<bool> { /* defaults to len() == 0 */ }
 }
 ```
 
 A byte-addressable, append-only store with an explicit durability barrier. The
-log frames records and tracks sequence numbers; a `WalStore` just holds the
-bytes. Implement it to put a log somewhere other than a file.
+log frames records and hands out byte offsets; a `WalStore` just holds the bytes.
+Every method takes `&self`, because the multi-writer append path writes from
+several threads at once — the store must accept concurrent positioned writes.
+Implement it to put a log somewhere other than a file.
 
 **Contract**
 
-- `append` places `bytes` immediately after the current end; after it returns
-  `Ok`, `len` has grown by `bytes.len()`.
+- `write_at` writes `bytes` at `offset`, growing the store and zero-filling any
+  gap if `offset` is past the current end (so a higher offset written first
+  leaves detectable zero bytes, like a sparse file). Concurrent calls to disjoint
+  ranges must not corrupt each other.
 - `read_at` fills `buf` from `offset`, returning the number of bytes read. A
   short return (fewer than `buf.len()`) means the store ended first — this is how
   recovery detects a torn tail.
 - `truncate` discards everything at or after `len`.
-- `sync` returns only once every prior `append` is durable.
+- `sync` returns only once every prior write is durable.
 
 **Example** — a minimal in-memory backend (the shipped [`MemStore`](#memstore)
-is this):
+is this, with a lock for `&self` mutation):
 
 ```rust
+use std::sync::Mutex;
 use wal_db::{Result, WalStore};
 
 #[derive(Default)]
-struct VecStore { data: Vec<u8> }
+struct VecStore { data: Mutex<Vec<u8>> }
 
 impl WalStore for VecStore {
-    fn append(&mut self, bytes: &[u8]) -> Result<()> {
-        self.data.extend_from_slice(bytes);
+    fn write_at(&self, offset: u64, bytes: &[u8]) -> Result<()> {
+        let (start, end) = (offset as usize, offset as usize + bytes.len());
+        let mut data = self.data.lock().unwrap();
+        if data.len() < end { data.resize(end, 0); }
+        data[start..end].copy_from_slice(bytes);
         Ok(())
     }
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        let data = self.data.lock().unwrap();
         let start = offset as usize;
-        if start >= self.data.len() { return Ok(0); }
-        let n = (self.data.len() - start).min(buf.len());
-        buf[..n].copy_from_slice(&self.data[start..start + n]);
+        if start >= data.len() { return Ok(0); }
+        let n = (data.len() - start).min(buf.len());
+        buf[..n].copy_from_slice(&data[start..start + n]);
         Ok(n)
     }
-    fn truncate(&mut self, len: u64) -> Result<()> {
-        self.data.truncate(len as usize);
+    fn truncate(&self, len: u64) -> Result<()> {
+        self.data.lock().unwrap().truncate(len as usize);
         Ok(())
     }
-    fn sync(&mut self) -> Result<()> { Ok(()) }
-    fn len(&self) -> Result<u64> { Ok(self.data.len() as u64) }
+    fn sync(&self) -> Result<()> { Ok(()) }
+    fn len(&self) -> Result<u64> { Ok(self.data.lock().unwrap().len() as u64) }
 }
 ```
 
@@ -618,12 +682,15 @@ pub struct MemStore { /* private */ }
 impl MemStore {
     pub fn new() -> Self;                          // also: Default
     pub fn with_capacity(capacity: usize) -> Self;
+    pub fn from_bytes(bytes: Vec<u8>) -> Self;
 }
 ```
 
-An in-memory `WalStore` backed by a `Vec<u8>`. `sync` is a no-op — memory has no
-durable tier — so it is for tests, examples, and benchmarking the framing path
-in isolation, not for durability. `Clone`, so a log image can be snapshotted.
+An in-memory `WalStore` backed by a `Vec<u8>` behind a short lock. `sync` is a
+no-op — memory has no durable tier — so it is for tests, examples, and
+benchmarking the framing path in isolation, not for durability. `from_bytes`
+preloads it with an existing log image so [`Wal::with_store`](#walwith_store--walwith_store_and_config)
+can recover it; it is `Clone`, so an image can be snapshotted.
 
 ```rust
 use wal_db::{MemStore, Wal};
@@ -755,25 +822,26 @@ wal.sync()?;
 
 ## On-disk format
 
-Each record is a fixed 16-byte header followed by its payload:
+Each record is a fixed 8-byte header followed by its payload:
 
 ```text
-+-----------+-----------+-----------+----------------------+
-| crc32c    | length    | lsn       | payload              |
-| 4 bytes   | 4 bytes   | 8 bytes   | `length` bytes       |
-+-----------+-----------+-----------+----------------------+
++-----------+-----------+----------------------+
+| crc32c    | length    | payload              |
+| 4 bytes   | 4 bytes   | `length` bytes       |
++-----------+-----------+----------------------+
 ```
 
 All integers are little-endian, fixed regardless of host byte order. The CRC32C
-(Castagnoli) checksum covers the length, the LSN, and the payload — everything
-after the checksum field. A torn write leaves either too few bytes to form a
-record or a payload that no longer matches the checksum; recovery detects both
-and stops.
+(Castagnoli) checksum covers the length and the payload — everything after the
+checksum field. There is no stored LSN: a record's LSN is its byte offset, which
+recovery already knows as it scans. A torn write leaves either too few bytes to
+form a record or a payload that no longer matches the checksum; recovery detects
+both and stops.
 
-> **Unstable across 0.x.** This layout is documented for orientation, not as a
-> compatibility guarantee. A normative byte-level specification
-> (`docs/ON_DISK_FORMAT.md`) ships in 0.3, at which point the format freezes for
-> the 1.x line.
+> **Frozen for 1.x as of 0.3.0.** The full normative specification, including the
+> exact CRC parameters and the recovery algorithm, is in
+> [`docs/ON_DISK_FORMAT.md`](./ON_DISK_FORMAT.md). The multi-file segment layout
+> is added in 0.3.1.
 
 <hr>
 <br>
@@ -786,8 +854,8 @@ and stops.
 |---------|---------|-------------|
 | _(none)_ | — | The default surface is empty; the crate is standard-library only. |
 
-Typed record framing via `serial-io` arrives as an additive feature in 0.4;
-group-commit tuning in 0.3. Feature flags will be additive only.
+Typed record framing via `serial-io` arrives as an additive feature in 0.4.
+Feature flags will be additive only.
 
 <hr>
 <br>

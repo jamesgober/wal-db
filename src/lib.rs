@@ -24,7 +24,8 @@
 //! let wal = Wal::open(&path)?;
 //!
 //! // Append a record; `append` returns once the bytes are in the kernel
-//! // page cache. It does not flush the disk.
+//! // page cache. It does not flush the disk. The returned LSN is the record's
+//! // byte offset — the first record starts at 0.
 //! let lsn = wal.append(b"the first record")?;
 //! assert_eq!(lsn.get(), 0);
 //!
@@ -40,6 +41,20 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! ## Concurrency and group commit
+//!
+//! `Wal` is built for many writers. [`append`](Wal::append) is lock-free: each
+//! call reserves its byte range with a single atomic step — that range's start
+//! offset *is* the record's [`Lsn`] — then writes its record without blocking
+//! the others. Share one `Wal` behind an [`Arc`](std::sync::Arc) and append from
+//! every thread.
+//!
+//! Durability is where threads cooperate. When several call [`sync`](Wal::sync)
+//! at once, they coalesce into a single fsync — **group commit** — so the cost
+//! of making data durable is amortised across everyone committing together
+//! rather than paid N times. [`append_and_sync`](Wal::append_and_sync) does an
+//! append and a group-commit-aware sync in one call.
 //!
 //! ## The durability contract
 //!
@@ -79,11 +94,10 @@
 //!
 //! ## Status
 //!
-//! This is the `0.2` foundation: a correct single-writer log with platform-correct
-//! durability and torn-write recovery. Appends are currently serialised through an
-//! internal mutex; the lock-free multi-writer append path and group commit land in
-//! `0.3`, at which point the on-disk format freezes. The four-call API above is
-//! stable and will not change shape.
+//! This is the `0.3` core: lock-free multi-writer append, group commit, and a
+//! frozen record format, on top of the platform-correct durability and
+//! torn-write recovery from `0.2`. Segment rotation follows in `0.3.1`. The
+//! four-call API is stable and will not change shape.
 
 #![deny(warnings)]
 #![deny(missing_docs)]
@@ -101,11 +115,13 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 #![deny(clippy::missing_safety_doc)]
 
+mod commit;
 mod config;
 mod error;
 mod lsn;
 mod record;
 mod store;
+mod sync;
 mod wal;
 
 pub use crate::config::WalConfig;

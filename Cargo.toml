@@ -9,7 +9,7 @@
 #╚═══════════════════════════════╝
 [package]
 name    = "wal-db"
-version = "0.2.0"
+version = "0.3.0"
 
 rust-version = "1.85"
 edition = "2024"
@@ -46,10 +46,15 @@ rustdoc-args = ["--cfg", "docsrs"]
 name = "wal_db"
 path = "src/lib.rs"
 
+# `loom` is a build-time cfg (`RUSTFLAGS="--cfg loom"`), not a Cargo feature, so
+# it is declared here to satisfy the `unexpected_cfgs` lint under `-D warnings`.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
 [features]
 # No optional features in the 0.2 foundation. Typed record framing via
-# `serial-io` arrives as an additive feature in 0.4; group-commit tuning
-# in 0.3. Kept empty here so the default surface stays minimal.
+# `serial-io` arrives as an additive feature in 0.4. Kept empty here so the
+# default surface stays minimal.
 default = []
 
 [dependencies]
@@ -76,7 +81,11 @@ criterion = { version = "0.5", features = ["html_reports"] }
 proptest  = "1"
 tempfile  = "3"
 
-[target.'cfg(loom)'.dev-dependencies]
+# `loom` is a normal (not dev) dependency under `--cfg loom` only: the library's
+# own synchronization primitives switch to loom's instrumented types so the
+# model checker can verify the append and commit paths. It is never pulled into
+# a normal build.
+[target.'cfg(loom)'.dependencies]
 loom = "0.7"
 
 [[bench]]

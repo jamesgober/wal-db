@@ -57,14 +57,15 @@ proptest! {
             prop_assert_eq!(got, original);
         }
 
-        // Truncating only ever removes a suffix: a larger cut keeps at least as
-        // much as the file already held up to that point.
+        // A cut at the very end keeps every record.
         if cut_at == full_len {
             prop_assert_eq!(recovered.len(), records.len());
         }
 
-        // After recovery the next append continues without an LSN gap.
+        // After recovery the next append continues at the recovered byte offset
+        // with no gap: the LSN equals the summed framed size of what survived.
+        let expected_tail: u64 = recovered.iter().map(|r| (8 + r.len()) as u64).sum();
         let next = wal.append(b"sentinel").unwrap();
-        prop_assert_eq!(next.get(), recovered.len() as u64);
+        prop_assert_eq!(next.get(), expected_tail);
     }
 }

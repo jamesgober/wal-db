@@ -29,7 +29,7 @@ fn main() -> Result<(), wal_db::WalError> {
 
     // Recovery phase: reopen and replay every record in order.
     let wal = Wal::open(&path)?;
-    println!("replaying {} bytes of log:", wal.len()?);
+    println!("replaying {} bytes of log:", wal.len());
     for entry in wal.iter()? {
         let entry = entry?;
         let text = String::from_utf8_lossy(entry.data());

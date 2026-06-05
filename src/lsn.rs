@@ -2,31 +2,39 @@
 
 use std::fmt;
 
-/// A log sequence number: the position of a record in the log, assigned at
+/// A log sequence number: a record's byte position in the log, assigned at
 /// append time.
 ///
-/// LSNs are dense and monotonic. The first record appended to a fresh log is
-/// [`Lsn(0)`](Lsn), the next is `Lsn(1)`, and so on, with no gaps. A record's
-/// LSN is stable: it identifies that record for the life of the log and is the
-/// value returned to recovery by [`Record::lsn`](crate::Record::lsn). Because
-/// they are dense and ordered, LSNs from one log can be compared directly to
-/// establish which record came first.
+/// An LSN is the byte offset where the record's frame begins. The first record
+/// appended to a fresh log is [`Lsn(0)`](Lsn); the next starts at the first
+/// record's end, and so on. LSNs are therefore **monotonic and unique but not
+/// consecutive** — each one is larger than the last by exactly the previous
+/// record's framed size. Defining the LSN as the offset is what lets the
+/// multi-writer append path stay lock-free: a single atomic reservation hands
+/// out the offset, and offset order is append order by construction, so two
+/// records can never share an LSN or land out of order.
 ///
-/// The number is a `u64`. At one appended record per nanosecond it would take
-/// roughly 585 years to exhaust the space, so wraparound is not a concern this
-/// type guards against.
+/// A record's LSN is stable for the life of the log and is the value returned by
+/// [`Record::lsn`](crate::Record::lsn). Comparing two LSNs establishes which
+/// record came first.
+///
+/// The number is a `u64`. Even an exabyte log uses only 60 bits of it, so
+/// wraparound is not a concern this type guards against.
 ///
 /// # Examples
 ///
 /// ```
 /// use wal_db::Lsn;
 ///
+/// // The first record always starts at offset 0.
 /// let first = Lsn::new(0);
-/// let second = Lsn::new(1);
+/// // A later record sits at a higher offset; the exact value depends on the
+/// // sizes of the records before it.
+/// let later = Lsn::new(64);
 ///
-/// assert!(first < second);
-/// assert_eq!(second.get(), 1);
-/// assert_eq!(u64::from(second), 1);
+/// assert!(first < later);
+/// assert_eq!(later.get(), 64);
+/// assert_eq!(u64::from(later), 64);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[must_use]
