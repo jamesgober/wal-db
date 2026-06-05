@@ -8,7 +8,7 @@ use std::{cell::RefCell, path::Path};
 
 use crate::{
     commit::Commit,
-    config::WalConfig,
+    config::{RecoveryPolicy, WalConfig},
     error::{Result, WalError},
     lsn::Lsn,
     record::{self, HEADER_LEN},
@@ -78,6 +78,7 @@ pub struct Wal<S = FileStore> {
     tail: CacheAligned<AtomicU64>,
     store: S,
     max_record_size: u32,
+    recovery_policy: RecoveryPolicy,
     commit: Commit,
 }
 
@@ -232,6 +233,7 @@ impl<S: WalStore> Wal<S> {
             tail: CacheAligned(AtomicU64::new(recovered)),
             store,
             max_record_size: config.max_record_size(),
+            recovery_policy: config.recovery_policy(),
             commit: Commit::new(recovered),
         })
     }
@@ -366,6 +368,45 @@ impl<S: WalStore> Wal<S> {
         Ok(lsn)
     }
 
+    /// Serialise `value` with `pack-io` and append it, returning its [`Lsn`].
+    ///
+    /// The typed counterpart to [`append`](Wal::append): the value is encoded to
+    /// bytes and appended as one record, which [`Record::decode`] reads back.
+    /// Available with the `pack-io` feature. Like `append`, it does not sync.
+    ///
+    /// # Errors
+    ///
+    /// - [`WalError::Encoding`] if the value fails to serialise.
+    /// - Otherwise the errors of [`append`](Wal::append) ([`WalError::RecordTooLarge`],
+    ///   [`WalError::Io`]).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use wal_db::{MemStore, Wal};
+    /// use wal_db::pack_io::{Deserialize, Serialize};
+    ///
+    /// #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    /// struct Entry {
+    ///     key: String,
+    ///     value: u64,
+    /// }
+    ///
+    /// # fn main() -> Result<(), wal_db::WalError> {
+    /// let wal = Wal::with_store(MemStore::new())?;
+    /// wal.append_typed(&Entry { key: "balance".into(), value: 100 })?;
+    ///
+    /// let entry: Entry = wal.iter()?.next().unwrap()?.decode()?;
+    /// assert_eq!(entry.value, 100);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(feature = "pack-io")]
+    pub fn append_typed<T: pack_io::Serialize + ?Sized>(&self, value: &T) -> Result<Lsn> {
+        let bytes = pack_io::encode(value).map_err(WalError::encoding)?;
+        self.append(&bytes)
+    }
+
     /// Iterate the log from the beginning, yielding each record in append order.
     ///
     /// The iterator walks the records that are fully written at the moment it is
@@ -399,6 +440,7 @@ impl<S: WalStore> Wal<S> {
             offset: 0,
             end,
             done: false,
+            policy: self.recovery_policy,
         })
     }
 
@@ -539,32 +581,85 @@ impl Record {
     pub fn into_data(self) -> Vec<u8> {
         self.data
     }
+
+    /// Decode the record's payload into a typed value via `pack-io`.
+    ///
+    /// The mirror of [`Wal::append_typed`]. Available with the `pack-io` feature.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WalError::Encoding`] if the bytes do not deserialise into `T` —
+    /// for example reading a record written as a different type.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use wal_db::{MemStore, Wal};
+    /// use wal_db::pack_io::{Deserialize, Serialize};
+    ///
+    /// #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    /// struct Event {
+    ///     id: u64,
+    ///     name: String,
+    /// }
+    ///
+    /// # fn main() -> Result<(), wal_db::WalError> {
+    /// let wal = Wal::with_store(MemStore::new())?;
+    /// wal.append_typed(&Event { id: 7, name: "boot".into() })?;
+    ///
+    /// let record = wal.iter()?.next().unwrap()?;
+    /// let event: Event = record.decode()?;
+    /// assert_eq!(event, Event { id: 7, name: "boot".into() });
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(feature = "pack-io")]
+    pub fn decode<T: pack_io::Deserialize>(&self) -> Result<T> {
+        pack_io::decode(&self.data).map_err(WalError::encoding)
+    }
+}
+
+/// The outcome of reading one record-sized chunk at the iterator's cursor.
+enum Step {
+    /// A valid record, plus the offset just past it.
+    Record(Record, u64),
+    /// A damaged record. `skip_to` is the offset of the next record if its
+    /// extent is known (length and payload present, only the checksum failed),
+    /// or `None` if the damage makes the next record's position unknowable.
+    Damaged(WalError, Option<u64>),
+    /// A clean end: a short read, meaning the log stops here (a torn tail).
+    End,
 }
 
 /// The iterator returned by [`Wal::iter`].
 ///
 /// Walks the records fully written when it was created, yielding
-/// `Result<`[`Record`]`>`. A corrupt record yields a single
-/// [`WalError::Corruption`] and then the iterator ends.
+/// `Result<`[`Record`]`>`. Behaviour at a damaged record follows the configured
+/// [`RecoveryPolicy`]: by default the iterator yields the damage once and stops;
+/// under [`RecoveryPolicy::SkipBadRecords`] it yields the damage and continues
+/// past it when the next record's position is still recoverable.
 pub struct WalIter<'a, S: WalStore = FileStore> {
     wal: &'a Wal<S>,
     offset: u64,
     end: u64,
     done: bool,
+    policy: RecoveryPolicy,
 }
 
 impl<S: WalStore> WalIter<'_, S> {
-    /// Read and validate the record at the current offset.
-    fn read_next(&mut self) -> Result<Option<Record>> {
+    /// Read and classify the record at the current offset, without advancing.
+    fn step(&self) -> Result<Step> {
         let mut header = [0u8; HEADER_LEN];
         if self.wal.store.read_at(self.offset, &mut header)? < HEADER_LEN {
-            return Ok(None);
+            return Ok(Step::End);
         }
         let parsed = record::parse_header(&header);
         if parsed.len > self.wal.max_record_size {
-            return Err(WalError::corruption(
-                self.offset,
-                "record length exceeds the maximum",
+            // The length is implausible, so the next record's position is
+            // unknowable — there is nothing to skip to.
+            return Ok(Step::Damaged(
+                WalError::corruption(self.offset, "record length exceeds the maximum"),
+                None,
             ));
         }
 
@@ -574,17 +669,28 @@ impl<S: WalStore> WalIter<'_, S> {
             .ok_or_else(|| WalError::corruption(self.offset, "record offset overflow"))?;
         let mut payload = vec![0u8; parsed.len as usize];
         if self.wal.store.read_at(payload_start, &mut payload)? < payload.len() {
-            return Ok(None);
+            return Ok(Step::End);
         }
-        if !record::verify(&header, &payload, parsed.crc) {
-            return Err(WalError::corruption(self.offset, "checksum mismatch"));
-        }
-
-        let lsn = Lsn::new(self.offset);
-        self.offset = payload_start
+        let next = payload_start
             .checked_add(u64::from(parsed.len))
             .ok_or_else(|| WalError::corruption(self.offset, "record offset overflow"))?;
-        Ok(Some(Record { lsn, data: payload }))
+
+        if !record::verify(&header, &payload, parsed.crc) {
+            // The length and payload are present, so we know where the next
+            // record starts even though this one is corrupt.
+            return Ok(Step::Damaged(
+                WalError::corruption(self.offset, "checksum mismatch"),
+                Some(next),
+            ));
+        }
+
+        Ok(Step::Record(
+            Record {
+                lsn: Lsn::new(self.offset),
+                data: payload,
+            },
+            next,
+        ))
     }
 }
 
@@ -595,9 +701,26 @@ impl<S: WalStore> Iterator for WalIter<'_, S> {
         if self.done || self.offset >= self.end {
             return None;
         }
-        match self.read_next() {
-            Ok(Some(record)) => Some(Ok(record)),
-            Ok(None) => {
+        match self.step() {
+            Ok(Step::Record(record, next)) => {
+                self.offset = next;
+                Some(Ok(record))
+            }
+            // Skip-bad-records, and the next record is locatable: surface the
+            // damage but continue from past it on the next call.
+            Ok(Step::Damaged(error, Some(next)))
+                if self.policy == RecoveryPolicy::SkipBadRecords =>
+            {
+                self.offset = next;
+                Some(Err(error))
+            }
+            // Stop-at-first-error, or damage that makes the next position
+            // unknowable: surface the damage and end.
+            Ok(Step::Damaged(error, _)) => {
+                self.done = true;
+                Some(Err(error))
+            }
+            Ok(Step::End) => {
                 self.done = true;
                 None
             }
@@ -638,6 +761,131 @@ mod tests {
             .unwrap()
             .map(|r| r.unwrap().into_data())
             .collect()
+    }
+
+    fn corrupt_byte(store: &MemStore, offset: u64) {
+        let mut byte = [0u8; 1];
+        store.read_at(offset, &mut byte).unwrap();
+        byte[0] ^= 0xFF;
+        store.write_at(offset, &byte).unwrap();
+    }
+
+    #[test]
+    fn test_stop_at_first_error_stops_at_corruption() {
+        let wal = Wal::with_store(MemStore::new()).unwrap(); // default policy
+        wal.append(b"first").unwrap();
+        let second = wal.append(b"second").unwrap();
+        wal.append(b"third").unwrap();
+        corrupt_byte(wal.store(), second.get() + HEADER_LEN as u64);
+
+        let items: Vec<_> = wal.iter().unwrap().collect();
+        assert_eq!(items.len(), 2); // first ok, second damaged, then stop
+        assert_eq!(items[0].as_ref().unwrap().data(), b"first");
+        assert!(matches!(items[1], Err(WalError::Corruption { .. })));
+    }
+
+    #[test]
+    fn test_skip_bad_records_continues_past_corruption() {
+        let config = WalConfig::new().with_recovery_policy(RecoveryPolicy::SkipBadRecords);
+        let wal = Wal::with_store_and_config(MemStore::new(), config).unwrap();
+        wal.append(b"first").unwrap();
+        let second = wal.append(b"second").unwrap();
+        wal.append(b"third").unwrap();
+        // Corrupt the payload only; the length prefix stays intact, so the
+        // record is skippable.
+        corrupt_byte(wal.store(), second.get() + HEADER_LEN as u64);
+
+        let items: Vec<_> = wal.iter().unwrap().collect();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].as_ref().unwrap().data(), b"first");
+        assert!(matches!(items[1], Err(WalError::Corruption { .. })));
+        assert_eq!(items[2].as_ref().unwrap().data(), b"third");
+    }
+
+    #[test]
+    fn test_skip_bad_records_still_stops_on_unreadable_length() {
+        let config = WalConfig::new()
+            .with_max_record_size(16)
+            .with_recovery_policy(RecoveryPolicy::SkipBadRecords);
+        let wal = Wal::with_store_and_config(MemStore::new(), config).unwrap();
+        wal.append(b"ok").unwrap();
+        let second = wal.append(b"victim").unwrap();
+        // Corrupt the length field to an implausible value: the next record's
+        // position becomes unknowable, so even skip-mode must stop.
+        corrupt_byte(wal.store(), second.get() + 4); // LEN_OFFSET within the header
+
+        let items: Vec<_> = wal.iter().unwrap().collect();
+        assert_eq!(items.len(), 2); // first ok, then a damaged stop
+        assert_eq!(items[0].as_ref().unwrap().data(), b"ok");
+        assert!(matches!(items[1], Err(WalError::Corruption { .. })));
+    }
+
+    #[cfg(feature = "pack-io")]
+    #[test]
+    fn test_typed_record_roundtrip() {
+        use pack_io::{Deserialize, Serialize};
+
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        struct Entry {
+            id: u64,
+            label: String,
+        }
+
+        let wal = Wal::with_store(MemStore::new()).unwrap();
+        wal.append_typed(&Entry {
+            id: 9,
+            label: "nine".into(),
+        })
+        .unwrap();
+        wal.append_typed(&Entry {
+            id: 10,
+            label: "ten".into(),
+        })
+        .unwrap();
+
+        let decoded: Vec<Entry> = wal
+            .iter()
+            .unwrap()
+            .map(|r| r.unwrap().decode().unwrap())
+            .collect();
+        assert_eq!(
+            decoded[0],
+            Entry {
+                id: 9,
+                label: "nine".into()
+            }
+        );
+        assert_eq!(
+            decoded[1],
+            Entry {
+                id: 10,
+                label: "ten".into()
+            }
+        );
+    }
+
+    #[cfg(feature = "pack-io")]
+    #[test]
+    fn test_typed_decode_wrong_type_errors() {
+        use pack_io::{Deserialize, Serialize};
+
+        #[derive(Serialize)]
+        struct Big {
+            a: u64,
+            b: u64,
+            c: u64,
+        }
+        #[derive(Deserialize)]
+        struct Small {
+            _a: u8,
+        }
+
+        let wal = Wal::with_store(MemStore::new()).unwrap();
+        wal.append_typed(&Big { a: 1, b: 2, c: 3 }).unwrap();
+        let record = wal.iter().unwrap().next().unwrap().unwrap();
+        // Decoding 24 bytes as a 1-byte type leaves trailing bytes -> error.
+        let result: Result<Small> = record.decode();
+        assert!(matches!(result, Err(WalError::Encoding { .. })));
     }
 
     #[test]

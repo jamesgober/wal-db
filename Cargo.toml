@@ -9,7 +9,7 @@
 #╚═══════════════════════════════╝
 [package]
 name    = "wal-db"
-version = "0.3.1"
+version = "0.4.0"
 
 rust-version = "1.85"
 edition = "2024"
@@ -52,10 +52,12 @@ path = "src/lib.rs"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [features]
-# No optional features in the 0.2 foundation. Typed record framing via
-# `serial-io` arrives as an additive feature in 0.4. Kept empty here so the
-# default surface stays minimal.
+# Default surface is minimal: a byte-record log. Typed records are opt-in.
 default = []
+# Typed records via `pack-io`: adds `Wal::append_typed` and `Record::decode`,
+# which serialise any `pack_io::Serialize`/`Deserialize` value. Additive — the
+# byte-record API is unchanged when this is off.
+pack-io = ["dep:pack-io"]
 
 [dependencies]
 # Domain error type. Portfolio crates standardise on `error-forge` for
@@ -67,6 +69,9 @@ error-forge = { version = "1.0", default-features = false }
 # with a software fallback. Zero dependencies of its own; rolling this by
 # hand would mean re-implementing the same intrinsics with no upside.
 crc32c = "0.6"
+# Optional typed-record framing, behind the `pack-io` feature. The `derive`
+# feature provides the `Serialize`/`Deserialize` derives consumers use.
+pack-io = { version = "1.0", features = ["derive"], optional = true }
 
 # macOS is the one platform where the standard library's fsync is not a
 # durability barrier: `File::sync_all` issues `fsync`, which flushes the
@@ -91,6 +96,12 @@ loom = "0.7"
 [[bench]]
 name    = "wal_bench"
 harness = false
+
+# The typed-records example needs the `pack-io` feature, so it is only built
+# when that feature is enabled (e.g. `cargo run --example typed --features pack-io`).
+[[example]]
+name              = "typed"
+required-features = ["pack-io"]
 
 [profile.release]
 opt-level     = 3

@@ -32,7 +32,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). Lock-free append. Group commit. Explicit fsync. Crash-safe recovery.
     </p>
     <blockquote>
-        <strong>Status: pre-1.0, in active development.</strong> <code>0.3.1</code> adds segment rotation. The concurrency core (<code>0.3.0</code>) is lock-free multi-writer append, group commit, and an <a href="./docs/ON_DISK_FORMAT.md">on-disk format frozen for 1.x</a>, on the platform-correct durability and torn-write recovery from <code>0.2</code>. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for detail.
+        <strong>Status: pre-1.0, in active development.</strong> <code>0.4</code> adds recovery hardening (a continuous fuzz harness, a skip-bad-records policy) and optional typed records via <code>pack-io</code>. On top of segment rotation (<code>0.3.1</code>) and the lock-free multi-writer append, group commit, and <a href="./docs/ON_DISK_FORMAT.md">1.x-frozen on-disk format</a> from <code>0.3.0</code>. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for detail.
     </blockquote>
 </div>
 
@@ -49,7 +49,10 @@
 - **Platform-correct flush** — `fdatasync` on Linux, `FlushFileBuffers` on Windows, `fcntl(F_FULLFSYNC)` on macOS
 - **Torn-write detection** — a CRC32C checksum per record; recovery stops at the first damaged record
 - **Self-healing recovery** — a torn tail from a crash mid-append is truncated on open, leaving a clean boundary
+- **Fuzz-hardened recovery** — arbitrary bytes never panic or over-allocate; a continuous `cargo-fuzz` harness proves it
+- **Recovery policies** — stop at the first damaged record, or skip past it for forensic partial recovery
 - **Iterator-based replay** — walk the log forward to rebuild state
+- **Typed records (optional)** — serialise any value via `pack-io` behind a feature; the byte-record API is unchanged when off
 - **Pluggable storage backend** — file-backed by default; injectable for in-memory testing and custom stores
 
 <br>
@@ -75,7 +78,7 @@ That flush is not the same call on every platform, and getting it wrong is silen
 
 ```toml
 [dependencies]
-wal-db = "0.3"
+wal-db = "0.4"
 ```
 
 <br>
@@ -223,6 +226,62 @@ wal.sync()?;
 
 <br>
 
+## Typed records
+
+By default a record is bytes. With the `pack-io` feature, a record can be any type that derives `Serialize`/`Deserialize` — `append_typed` writes it, `Record::decode` reads it back. The derives come from the re-exported `wal_db::pack_io`, so no extra dependency is needed.
+
+```toml
+[dependencies]
+wal-db = { version = "0.4", features = ["pack-io"] }
+```
+
+```rust
+use wal_db::{MemStore, Wal};
+use wal_db::pack_io::{Serialize, Deserialize};
+
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
+struct Event { id: u64, name: String }
+
+# fn main() -> Result<(), wal_db::WalError> {
+let wal = Wal::with_store(MemStore::new())?;
+wal.append_typed(&Event { id: 1, name: "start".into() })?;
+
+let event: Event = wal.iter()?.next().unwrap()?.decode()?;
+assert_eq!(event, Event { id: 1, name: "start".into() });
+# Ok(())
+# }
+```
+
+<br>
+
+## Recovery policies
+
+`Wal::open` always truncates a torn tail so the append boundary is clean. For corruption *inside* an already-recovered log — bit rot, say — a `WalConfig` recovery policy controls how iteration reacts:
+
+```rust
+use wal_db::{RecoveryPolicy, Wal, WalConfig};
+
+# fn main() -> Result<(), wal_db::WalError> {
+# let dir = tempfile::tempdir().map_err(wal_db::WalError::from)?;
+# let path = dir.path().join("app.wal");
+// Default: stop at the first damaged record. Or skip past it for partial recovery:
+let config = WalConfig::new().with_recovery_policy(RecoveryPolicy::SkipBadRecords);
+let wal = Wal::open_with(&path, config)?;
+
+for entry in wal.iter()? {
+    match entry {
+        Ok(record) => { /* use it */ }
+        Err(e) => eprintln!("skipped a damaged record: {e}"), // iteration continues
+    }
+}
+# Ok(())
+# }
+```
+
+Skipping is never silent — each damaged record is still surfaced as an error — and it only works while a record's length prefix is intact enough to locate the next one.
+
+<br>
+
 ## Performance
 
 Numbers from the criterion suite (`cargo bench`) on the development machine, with 256-byte records. They are honest measurements, not marketing — the group-commit figure in particular is bounded by this machine's fsync latency and scales with faster storage and more concurrent writers.
@@ -248,6 +307,8 @@ cargo bench --bench wal_bench
 |---------|-----|-------|
 | [`basic`](./examples/basic.rs) | `cargo run --example basic` | the four-call API: open, append, sync, replay |
 | [`recovery`](./examples/recovery.rs) | `cargo run --example recovery` | a simulated torn write and self-healing recovery |
+| [`concurrent`](./examples/concurrent.rs) | `cargo run --example concurrent` | many writers, one log, group commit |
+| [`typed`](./examples/typed.rs) | `cargo run --example typed --features pack-io` | typed records via `pack-io` |
 
 <br>
 
@@ -257,11 +318,13 @@ cargo bench --bench wal_bench
 cargo test --all-features                       # unit, integration, doc tests
 cargo test --test torn_write                    # torn-write recovery property test
 cargo test --test durability                    # durability across a real process restart
+cargo test --test segmented                     # segment rotation and spanning records
 RUSTFLAGS="--cfg loom" cargo test --test loom_wal  # model-checked concurrency
+cargo +nightly fuzz run recover                 # fuzz the recovery path
 cargo bench --bench wal_bench                    # append and commit throughput
 ```
 
-The `loom` run model-checks the lock-free append and the group-commit handshake: it explores every meaningful thread interleaving and asserts no overlapping records, no reorder, and at most one fsync per syncer.
+The `loom` run model-checks the lock-free append and the group-commit handshake: it explores every meaningful thread interleaving and asserts no overlapping records, no reorder, and at most one fsync per syncer. The `fuzz` run feeds arbitrary bytes to the recovery path and proves it never panics or over-allocates.
 
 <hr>
 <br>

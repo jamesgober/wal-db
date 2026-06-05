@@ -65,6 +65,18 @@ pub enum WalError {
         /// A short, human-readable reason the record was rejected.
         reason: &'static str,
     },
+
+    /// A typed record could not be encoded or decoded.
+    ///
+    /// Produced only by the typed-record API (the `pack-io` feature):
+    /// [`Wal::append_typed`](crate::Wal::append_typed) when a value fails to
+    /// serialise, or [`Record::decode`](crate::Record::decode) when a record's
+    /// bytes do not deserialise into the requested type. `detail` carries the
+    /// underlying codec error's message.
+    Encoding {
+        /// The underlying serialization error, as text.
+        detail: String,
+    },
 }
 
 impl WalError {
@@ -76,6 +88,14 @@ impl WalError {
     /// Build a [`WalError::Corruption`] for the record at `offset`.
     pub(crate) fn corruption(offset: u64, reason: &'static str) -> Self {
         WalError::Corruption { offset, reason }
+    }
+
+    /// Build a [`WalError::Encoding`] from a codec error's message.
+    #[cfg(feature = "pack-io")]
+    pub(crate) fn encoding(detail: impl core::fmt::Display) -> Self {
+        WalError::Encoding {
+            detail: detail.to_string(),
+        }
     }
 }
 
@@ -94,6 +114,9 @@ impl fmt::Display for WalError {
             WalError::Corruption { offset, reason } => {
                 write!(f, "log corruption at byte offset {offset}: {reason}")
             }
+            WalError::Encoding { detail } => {
+                write!(f, "typed record codec error: {detail}")
+            }
         }
     }
 }
@@ -102,7 +125,9 @@ impl std::error::Error for WalError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             WalError::Io { source, .. } => Some(source),
-            WalError::RecordTooLarge { .. } | WalError::Corruption { .. } => None,
+            WalError::RecordTooLarge { .. }
+            | WalError::Corruption { .. }
+            | WalError::Encoding { .. } => None,
         }
     }
 }
@@ -126,6 +151,7 @@ impl ForgeError for WalError {
             WalError::Io { .. } => "Io",
             WalError::RecordTooLarge { .. } => "RecordTooLarge",
             WalError::Corruption { .. } => "Corruption",
+            WalError::Encoding { .. } => "Encoding",
         }
     }
 

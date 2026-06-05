@@ -1,0 +1,25 @@
+# cargo-fuzz harness for the recovery path. Run with:
+#   cargo +nightly fuzz run recover
+# This is a standalone crate (its own `[workspace]`) so the main package's
+# `cargo build`/`clippy`/`test` never pull it in.
+[package]
+name = "wal-db-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+wal-db = { path = ".." }
+
+[[bin]]
+name = "recover"
+path = "fuzz_targets/recover.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

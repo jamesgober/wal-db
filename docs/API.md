@@ -32,6 +32,7 @@
   - [`Wal::append`](#walappend)
   - [`Wal::sync`](#walsync)
   - [`Wal::append_and_sync`](#walappend_and_sync)
+  - [`Wal::append_typed`](#walappend_typed)
   - [`Wal::iter`](#waliter)
   - [`Wal::len` / `Wal::is_empty`](#wallen--walis_empty)
   - [`Lsn`](#lsn)
@@ -39,6 +40,7 @@
   - [`WalIter`](#waliter-type)
 - [Tier 2 — configuration](#tier-2--configuration)
   - [`WalConfig`](#walconfig)
+  - [`RecoveryPolicy`](#recoverypolicy)
   - [`Wal::open_with`](#walopen_with)
   - [`Wal::open_segmented`](#walopen_segmented)
 - [Tier 3 — custom backends](#tier-3--custom-backends)
@@ -83,7 +85,10 @@ iterator-based and stops at the first torn or corrupt record.
 
 ```toml
 [dependencies]
-wal-db = "0.3"
+wal-db = "0.4"
+
+# Typed records via pack-io:
+wal-db = { version = "0.4", features = ["pack-io"] }
 ```
 
 The default feature set is empty; the crate is standard-library only.
@@ -308,6 +313,39 @@ assert_eq!(wal.iter()?.count(), 100);
 # }
 ```
 
+### `Wal::append_typed`
+
+```rust
+// Requires the `pack-io` feature.
+pub fn append_typed<T: pack_io::Serialize + ?Sized>(&self, value: &T) -> Result<Lsn>
+```
+
+The typed counterpart to [`append`](#walappend): serialise `value` with
+`pack-io` and append it as one record, which [`Record::decode`](#record) reads
+back. Available with the `pack-io` feature; like `append`, it does not sync. The
+`Serialize`/`Deserialize` derives are re-exported as `wal_db::pack_io`, so
+consumers do not add the dependency themselves.
+
+**Returns** the assigned `Lsn`, or [`WalError::Encoding`](#walerror) if the value
+fails to serialise (otherwise [`append`](#walappend)'s errors).
+
+```rust
+use wal_db::{MemStore, Wal};
+use wal_db::pack_io::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
+struct Entry { key: String, value: u64 }
+
+# fn main() -> Result<(), wal_db::WalError> {
+let wal = Wal::with_store(MemStore::new())?;
+wal.append_typed(&Entry { key: "balance".into(), value: 100 })?;
+
+let entry: Entry = wal.iter()?.next().unwrap()?.decode()?;
+assert_eq!(entry.value, 100);
+# Ok(())
+# }
+```
+
 ### `Wal::iter`
 
 ```rust
@@ -460,12 +498,16 @@ impl Record {
     pub fn len(&self) -> usize;
     pub fn is_empty(&self) -> bool;
     pub fn into_data(self) -> Vec<u8>;
+    pub fn decode<T: pack_io::Deserialize>(&self) -> Result<T>; // pack-io feature
 }
 ```
 
 One record read back during iteration: its [`Lsn`](#lsn) (its byte offset) and
 its payload bytes. Yielded by [`Wal::iter`](#waliter). Borrow the payload with
-`data`, or take ownership of it without copying via `into_data`.
+`data`, or take ownership of it without copying via `into_data`. With the
+`pack-io` feature, `decode` deserialises the payload into a typed value — the
+mirror of [`Wal::append_typed`](#walappend_typed) — returning
+[`WalError::Encoding`](#walerror) if the bytes do not match the requested type.
 
 ```rust
 use wal_db::{MemStore, Wal};
@@ -520,14 +562,15 @@ impl WalConfig {
     pub const fn new() -> Self;                              // also: Default
     pub const fn with_max_record_size(self, bytes: u32) -> Self;
     pub const fn max_record_size(self) -> u32;
+    pub const fn with_recovery_policy(self, policy: RecoveryPolicy) -> Self;
+    pub const fn recovery_policy(self) -> RecoveryPolicy;
 }
 ```
 
 A builder for log tunables. Construct with `new` (or `Default`), set parameters
 with the `with_*` methods, and pass it to [`Wal::open_with`](#walopen_with) or
 [`Wal::with_store_and_config`](#walwith_store--walwith_store_and_config). The
-builder shape means new parameters added in later milestones (segment size in
-0.3.1, sync policy) will not break existing call sites.
+builder shape means new parameters do not break existing call sites.
 
 **`max_record_size`** — the largest record the log will accept, in bytes
 (default 64 MiB). [`append`](#walappend) rejects anything larger, and recovery
@@ -535,15 +578,44 @@ rejects any on-disk length prefix that claims to be larger *before* reading the
 payload. That second use bounds the allocation a corrupt or hostile log can
 request.
 
-```rust
-use wal_db::WalConfig;
+**`recovery_policy`** — how iteration reacts to a damaged record; see
+[`RecoveryPolicy`](#recoverypolicy). Defaults to `StopAtFirstError`.
 
-let config = WalConfig::new().with_max_record_size(1024 * 1024);
+```rust
+use wal_db::{RecoveryPolicy, WalConfig};
+
+let config = WalConfig::new()
+    .with_max_record_size(1024 * 1024)
+    .with_recovery_policy(RecoveryPolicy::SkipBadRecords);
 assert_eq!(config.max_record_size(), 1024 * 1024);
+assert_eq!(config.recovery_policy(), RecoveryPolicy::SkipBadRecords);
 
 let default = WalConfig::default();
 assert_eq!(default.max_record_size(), 64 * 1024 * 1024);
+assert_eq!(default.recovery_policy(), RecoveryPolicy::StopAtFirstError);
 ```
+
+### `RecoveryPolicy`
+
+Source: `src/config.rs`
+
+```rust
+#[non_exhaustive]
+pub enum RecoveryPolicy {
+    StopAtFirstError,
+    SkipBadRecords,
+}
+```
+
+How [`Wal::iter`](#waliter) reacts to a damaged record. This governs
+*iteration*, not the torn-tail truncation [`Wal::open`](#walopen) always performs
+to keep the append boundary clean — it matters when a record in the middle of an
+already-recovered log is damaged (bit rot, say).
+
+| Variant | Behaviour |
+|---------|-----------|
+| `StopAtFirstError` (default) | Yield the damaged record as a single [`WalError::Corruption`](#walerror), then end. Right for an append-only log, where a damaged record means everything after it is suspect. |
+| `SkipBadRecords` | Yield the damage as a [`WalError::Corruption`](#walerror) — never silently — then resume at the next record. For forensic / partial recovery. Only works while the damaged record's length prefix is intact enough to locate the next one; an unreadable length still stops iteration. |
 
 ### `Wal::open_with`
 
@@ -820,6 +892,7 @@ pub enum WalError {
     Io { context: &'static str, source: io::Error },
     RecordTooLarge { len: usize, max: u32 },
     Corruption { offset: u64, reason: &'static str },
+    Encoding { detail: String },
 }
 ```
 
@@ -834,6 +907,7 @@ arm.
 | `Io` | An underlying I/O operation failed; `context` names the operation, `source` is the original `io::Error`. | Inspect `source` for the kind (disk full, permission denied). After an append error, reopen the log. |
 | `RecordTooLarge` | The record exceeds [`max_record_size`](#walconfig). The log is unchanged. | Split the payload or raise the limit. |
 | `Corruption` | Recovery reached a record that is incomplete or fails its checksum, at byte `offset`. | Everything after `offset` is untrustworthy; stop and investigate. `is_fatal()` returns `true`. |
+| `Encoding` | A typed record (the `pack-io` feature) failed to encode or decode; `detail` is the codec error's message. | Check the value or the type being decoded into. |
 
 ```rust
 use wal_db::WalError;
@@ -873,8 +947,8 @@ use wal_db::prelude::*;
 ```
 
 Re-exports the four-call API and the types its methods return: `Wal`, `Lsn`,
-`Record`, `WalConfig`, `WalStore`, `WalError`, and `Result`. Enough for the great
-majority of uses.
+`Record`, `WalConfig`, `RecoveryPolicy`, `WalStore`, `WalError`, and `Result`.
+Enough for the great majority of uses.
 
 ```rust
 use wal_db::prelude::*;
@@ -926,10 +1000,11 @@ both and stops.
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| _(none)_ | — | The default surface is empty; the crate is standard-library only. |
+| `pack-io` | no | Typed records via [`pack-io`](https://crates.io/crates/pack-io): adds [`Wal::append_typed`](#walappend_typed) and [`Record::decode`](#record), and re-exports `wal_db::pack_io` for the derives. |
 
-Typed record framing via `serial-io` arrives as an additive feature in 0.4.
-Feature flags will be additive only.
+The default surface is empty and standard-library only. Feature flags are
+additive: enabling `pack-io` only adds API, it never changes the byte-record
+behaviour.
 
 <hr>
 <br>

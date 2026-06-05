@@ -18,6 +18,41 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [0.4.0] - 2026-06-05
+
+Recovery hardening and optional typed records. A continuous fuzz harness proves
+the recovery path never panics or over-allocates on arbitrary bytes; a
+skip-bad-records policy enables forensic partial recovery; and the `pack-io`
+feature lets records be typed values rather than raw bytes. Additive — the
+default byte-record API is unchanged.
+
+### Added
+
+- **`pack-io` feature** — typed records. `Wal::append_typed` serialises any
+  `pack_io::Serialize` value into a record, and `Record::decode` reads it back as
+  a `pack_io::Deserialize` type. The derives are re-exported as `wal_db::pack_io`,
+  so consumers need not add the dependency. Off by default; the byte-record API is
+  unchanged when it is off.
+- **`RecoveryPolicy`** — `StopAtFirstError` (default) or `SkipBadRecords`, set via
+  `WalConfig::with_recovery_policy`. `SkipBadRecords` surfaces each damaged record
+  as an error and then resumes at the next one, for forensic or partial recovery
+  of mid-log corruption. `Wal::open` still truncates a torn tail regardless, to
+  keep the append boundary clean.
+- **`WalError::Encoding`** — a typed record failed to encode or decode (additive,
+  via `#[non_exhaustive]`).
+- **Recovery fuzz harness** (`fuzz/`, `cargo-fuzz`) — arbitrary bytes fed to the
+  recovery path never panic, over-allocate, or read past the input. Run with
+  `cargo +nightly fuzz run recover`.
+- `examples/concurrent.rs` (multi-writer group commit) and `examples/typed.rs`
+  (typed records).
+
+### Changed
+
+- CI now runs the `loom` job for real (it previously swallowed failures while no
+  loom tests existed) and adds a continuous fuzz job.
+
+---
+
 ## [0.3.1] - 2026-06-05
 
 Segment rotation. The log can now be striped across bounded, fixed-size segment
@@ -147,7 +182,7 @@ on-disk format follow in 0.3.
   the mandated `error-forge` dependency is itself `std`.
 - Dropped the scaffold's placeholder `pack-io` optional dependency and the
   `std` / `batching` feature flags. Typed record framing returns as an additive
-  `serial-io` feature in 0.4; group-commit tuning in 0.3. The default feature set
+  `pack-io` feature in 0.4; group-commit tuning in 0.3. The default feature set
   is empty.
 
 ### Notes
@@ -175,7 +210,8 @@ Initial scaffold and repository bootstrap. No WAL logic yet — this release est
 - `.gitattributes` normalising line endings and excluding development paths from archives.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) — gitignored.
 
-[Unreleased]: https://github.com/jamesgober/wal-db/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/jamesgober/wal-db/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/jamesgober/wal-db/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/jamesgober/wal-db/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/jamesgober/wal-db/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/wal-db/compare/v0.1.0...v0.2.0

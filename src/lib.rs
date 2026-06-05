@@ -125,12 +125,21 @@ mod store;
 mod sync;
 mod wal;
 
-pub use crate::config::WalConfig;
+pub use crate::config::{RecoveryPolicy, WalConfig};
 pub use crate::error::{Result, WalError};
 pub use crate::lsn::Lsn;
 pub use crate::segment::SegmentedStore;
 pub use crate::store::{FileStore, MemStore, WalStore};
 pub use crate::wal::{Record, Wal, WalIter};
+
+/// The `pack-io` codec, re-exported so typed-record consumers can derive
+/// `Serialize`/`Deserialize` without adding the dependency themselves.
+///
+/// Available only with the `pack-io` feature. Use it as
+/// `use wal_db::pack_io::{Serialize, Deserialize};` alongside
+/// [`Wal::append_typed`] and [`Record::decode`].
+#[cfg(feature = "pack-io")]
+pub use pack_io;
 
 /// The common imports for working with a log.
 ///
@@ -150,7 +159,7 @@ pub use crate::wal::{Record, Wal, WalIter};
 /// # }
 /// ```
 pub mod prelude {
-    pub use crate::config::WalConfig;
+    pub use crate::config::{RecoveryPolicy, WalConfig};
     pub use crate::error::{Result, WalError};
     pub use crate::lsn::Lsn;
     pub use crate::store::WalStore;

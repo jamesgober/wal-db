@@ -45,9 +45,23 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Loom
-        run: cargo test --test loom_wal || echo "(loom test not yet present)"
+        run: cargo test --test loom_wal
         env:
           RUSTFLAGS: "--cfg loom"
+
+  fuzz:
+    name: Fuzz (recovery)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: Fuzz the recovery path
+        run: cargo fuzz run recover -- -max_total_time=120 -rss_limit_mb=2048
 
   security:
     name: Security (audit + deny)
