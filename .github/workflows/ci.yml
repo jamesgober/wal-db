@@ -55,13 +55,18 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: x86_64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-fuzz
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
+      # `--target` is pinned to gnu: the prebuilt cargo-fuzz is a musl-static
+      # binary and otherwise defaults the fuzz target to musl, where ASAN cannot
+      # link against the statically linked libc.
       - name: Fuzz the recovery path
-        run: cargo fuzz run recover -- -max_total_time=120 -rss_limit_mb=2048
+        run: cargo fuzz run recover --target x86_64-unknown-linux-gnu -- -max_total_time=120 -rss_limit_mb=2048
 
   security:
     name: Security (audit + deny)
