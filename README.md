@@ -32,7 +32,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). Lock-free append. Group commit. Explicit fsync. Crash-safe recovery.
     </p>
     <blockquote>
-        <strong>Status: pre-1.0, in active development.</strong> <code>0.3</code> is the concurrency core — lock-free multi-writer append, group commit, and a record format <a href="./docs/ON_DISK_FORMAT.md">frozen for 1.x</a>, on the platform-correct durability and torn-write recovery from <code>0.2</code>. Segment rotation follows in <code>0.3.1</code>. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for detail.
+        <strong>Status: pre-1.0, in active development.</strong> <code>0.3.1</code> adds segment rotation. The concurrency core (<code>0.3.0</code>) is lock-free multi-writer append, group commit, and an <a href="./docs/ON_DISK_FORMAT.md">on-disk format frozen for 1.x</a>, on the platform-correct durability and torn-write recovery from <code>0.2</code>. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for detail.
     </blockquote>
 </div>
 
@@ -44,6 +44,7 @@
 - **Append-only durable log** of arbitrary byte records
 - **Lock-free multi-writer append** — many threads append at once with no global lock
 - **Group commit** — concurrent `sync` calls coalesce into one fsync, amortising the durability cost
+- **Segment rotation** — optionally stripe the log across bounded segment files for bounded recovery and archival
 - **Explicit durability barriers** — `append` is in-memory-fast; `sync` is the durability point
 - **Platform-correct flush** — `fdatasync` on Linux, `FlushFileBuffers` on Windows, `fcntl(F_FULLFSYNC)` on macOS
 - **Torn-write detection** — a CRC32C checksum per record; recovery stops at the first damaged record
@@ -197,6 +198,25 @@ use wal_db::{MemStore, Wal};
 let wal = Wal::with_store(MemStore::new())?;
 let lsn = wal.append(b"no filesystem involved")?;
 assert_eq!(lsn.get(), 0);
+# Ok(())
+# }
+```
+
+<br>
+
+## Segments
+
+By default a log is a single file. For bounded recovery time and archival, stripe it across fixed-size segment files in a directory instead — `Wal::open_segmented`. The log stays one continuous byte stream; records span segment boundaries freely (the same scheme PostgreSQL uses), so nothing about the API or the records changes:
+
+```rust
+use wal_db::Wal;
+
+# fn main() -> Result<(), wal_db::WalError> {
+# let dir = tempfile::tempdir().map_err(wal_db::WalError::from)?;
+// 16 MiB segments. Old, superseded segment files can be archived or pruned.
+let wal = Wal::open_segmented(dir.path(), 16 * 1024 * 1024)?;
+wal.append(b"striped across files")?;
+wal.sync()?;
 # Ok(())
 # }
 ```

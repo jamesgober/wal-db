@@ -298,7 +298,7 @@ impl WalStore for MemStore {
 /// but leaves the data in the device's own write cache, where a power loss can
 /// still take it. `F_FULLFSYNC` is the documented way to force a full flush.
 #[cfg(target_os = "macos")]
-fn durable_sync(file: &File) -> io::Result<()> {
+pub(crate) fn durable_sync(file: &File) -> io::Result<()> {
     use std::os::unix::io::AsRawFd;
 
     let fd = file.as_raw_fd();
@@ -318,7 +318,7 @@ fn durable_sync(file: &File) -> io::Result<()> {
 /// Both are true durability barriers, so the standard library call is correct
 /// on every platform except macOS.
 #[cfg(not(target_os = "macos"))]
-fn durable_sync(file: &File) -> io::Result<()> {
+pub(crate) fn durable_sync(file: &File) -> io::Result<()> {
     file.sync_data()
 }
 
@@ -329,7 +329,7 @@ fn durable_sync(file: &File) -> io::Result<()> {
 // ---------------------------------------------------------------------------
 
 #[cfg(unix)]
-fn pwrite_all(file: &File, mut offset: u64, mut buf: &[u8]) -> io::Result<()> {
+pub(crate) fn pwrite_all(file: &File, mut offset: u64, mut buf: &[u8]) -> io::Result<()> {
     use std::os::unix::fs::FileExt;
 
     while !buf.is_empty() {
@@ -352,7 +352,7 @@ fn pwrite_all(file: &File, mut offset: u64, mut buf: &[u8]) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn pwrite_all(file: &File, mut offset: u64, mut buf: &[u8]) -> io::Result<()> {
+pub(crate) fn pwrite_all(file: &File, mut offset: u64, mut buf: &[u8]) -> io::Result<()> {
     use std::os::windows::fs::FileExt;
 
     while !buf.is_empty() {
@@ -375,7 +375,7 @@ fn pwrite_all(file: &File, mut offset: u64, mut buf: &[u8]) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn pread_fill(file: &File, mut offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+pub(crate) fn pread_fill(file: &File, mut offset: u64, buf: &mut [u8]) -> io::Result<usize> {
     use std::os::unix::fs::FileExt;
 
     let mut total = 0;
@@ -394,7 +394,7 @@ fn pread_fill(file: &File, mut offset: u64, buf: &mut [u8]) -> io::Result<usize>
 }
 
 #[cfg(windows)]
-fn pread_fill(file: &File, mut offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+pub(crate) fn pread_fill(file: &File, mut offset: u64, buf: &mut [u8]) -> io::Result<usize> {
     use std::os::windows::fs::FileExt;
 
     let mut total = 0;

@@ -19,15 +19,14 @@
 > Normative specification of the bytes `wal-db` writes. The **record format** in
 > this document is **frozen for the 1.x line** as of `0.3.0`: a record written by
 > any `>= 0.3.0`, `< 2.0.0` release reads back identically on any other. The
-> multi-file segment layout is added in `0.3.1`; this document covers a single
-> log file.
+> **segment layout** below is frozen as of `0.3.1`.
 
 ## Status and stability
 
 | Element | Stability |
 |---------|-----------|
-| Record framing (this document) | Frozen for 1.x as of 0.3.0 |
-| Segment-file naming / directory layout | Defined in 0.3.1 |
+| Record framing | Frozen for 1.x as of 0.3.0 |
+| Segment-file naming / directory layout | Frozen for 1.x as of 0.3.1 |
 
 A change to the frozen record format would be a breaking change requiring a major
 version and a documented migration. Additive, backward-compatible changes (a new
@@ -42,14 +41,19 @@ version.
 
 ## Log structure
 
-A log file is a bare sequence of records, back to back, starting at offset 0.
-There is no file header. A record's **log sequence number (LSN) is the byte
-offset at which it begins**; the first record has LSN 0.
+A log is a bare sequence of records, back to back, in one continuous byte
+address space starting at offset 0. There is no file header. A record's **log
+sequence number (LSN) is the byte offset at which it begins**; the first record
+has LSN 0.
 
 ```text
 offset 0      LSN_1          LSN_2                    end
   |  record 1  |   record 2   |   record 3   | ... |
 ```
+
+That address space may live in a single file or be striped across segment files
+(see [Segments](#segments) below); either way the bytes and the offsets are
+identical. The record format does not depend on which storage is used.
 
 ## Record layout
 
@@ -138,6 +142,51 @@ A crash partway through an append leaves either too few bytes to form a record
 (caught at step 1 or 3) or a payload that no longer matches the checksum (caught
 at step 4). In every case recovery stops cleanly at that record and never reports
 it as complete.
+
+## Segments
+
+A log may be stored as a single file, or striped across **segment files** in a
+directory so each file stays bounded (which keeps recovery time bounded and lets
+old, fully superseded files be archived or pruned). The two are equivalent at the
+byte level: the continuous address space above is simply split into fixed-size
+pieces.
+
+### Directory layout
+
+Each segment is a file named with its **zero-padded 20-digit decimal index** and
+the extension `.wal`:
+
+```text
+00000000000000000000.wal   segment 0  -> byte range [0,           S)
+00000000000000000001.wal   segment 1  -> byte range [S,         2*S)
+00000000000000000002.wal   segment 2  -> byte range [2*S,       3*S)
+...
+```
+
+where `S` is the configured segment size in bytes. Segment `k` holds the
+log's bytes `[k*S, (k+1)*S)`. The index is fixed-width so the files sort
+lexically into log order, and any file in the directory whose name is not exactly
+20 digits followed by `.wal` is ignored.
+
+### Mapping and spanning
+
+A logical byte at offset `O` lives in segment `O / S` at local offset `O % S`. A
+record is **not** aligned to segments and may **span** them: a write or read that
+crosses a boundary is split across the two files. Every segment except the last
+is exactly `S` bytes; the last is partially filled. There are no gaps and no
+padding — the address space is contiguous across files, exactly as in a single
+file.
+
+This is the same scheme PostgreSQL uses for its WAL (a continuous record stream
+divided into fixed-size segment files).
+
+### Recovery and truncation across segments
+
+Recovery is the same forward scan as above, reading through segment boundaries
+transparently. It ends when a read returns short — either a torn record (as
+above) or a missing segment file, which marks the end of the log. Truncating the
+log to length `L` shrinks the segment containing `L` to `L % S` bytes and deletes
+every segment file with index greater than `L / S`.
 
 <hr>
 <br>

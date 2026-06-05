@@ -120,6 +120,7 @@ mod config;
 mod error;
 mod lsn;
 mod record;
+mod segment;
 mod store;
 mod sync;
 mod wal;
@@ -127,6 +128,7 @@ mod wal;
 pub use crate::config::WalConfig;
 pub use crate::error::{Result, WalError};
 pub use crate::lsn::Lsn;
+pub use crate::segment::SegmentedStore;
 pub use crate::store::{FileStore, MemStore, WalStore};
 pub use crate::wal::{Record, Wal, WalIter};
 

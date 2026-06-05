@@ -18,6 +18,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [0.3.1] - 2026-06-05
+
+Segment rotation. The log can now be striped across bounded, fixed-size segment
+files instead of one growing file, which keeps recovery time bounded and lets old
+segments be archived or pruned. Additive and non-breaking: single-file logs are
+unchanged, and records, LSNs, and the four-call API are identical.
+
+### Added
+
+- **`SegmentedStore`** — a `WalStore` that maps the log's continuous byte space
+  onto fixed-size segment files in a directory. A write or read crossing a
+  boundary is split across files, so records span segments freely (the
+  PostgreSQL scheme). Segments are created lazily, and `sync` flushes only the
+  segments with unwritten changes.
+- **`Wal::open_segmented`** and **`Wal::open_segmented_with`** — open a log over a
+  directory of segment files.
+- `docs/ON_DISK_FORMAT.md` now specifies the segment-file naming and directory
+  layout, **frozen for the 1.x line**.
+
+---
+
 ## [0.3.0] - 2026-06-05
 
 The concurrency core: lock-free multi-writer append, group commit, and a record
@@ -154,7 +175,8 @@ Initial scaffold and repository bootstrap. No WAL logic yet — this release est
 - `.gitattributes` normalising line endings and excluding development paths from archives.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) — gitignored.
 
-[Unreleased]: https://github.com/jamesgober/wal-db/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/jamesgober/wal-db/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/jamesgober/wal-db/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/jamesgober/wal-db/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/wal-db/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/wal-db/releases/tag/v0.1.0

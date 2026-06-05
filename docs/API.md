@@ -40,10 +40,12 @@
 - [Tier 2 — configuration](#tier-2--configuration)
   - [`WalConfig`](#walconfig)
   - [`Wal::open_with`](#walopen_with)
+  - [`Wal::open_segmented`](#walopen_segmented)
 - [Tier 3 — custom backends](#tier-3--custom-backends)
   - [`WalStore`](#walstore)
   - [`FileStore`](#filestore)
   - [`MemStore`](#memstore)
+  - [`SegmentedStore`](#segmentedstore)
   - [`Wal::with_store` / `Wal::with_store_and_config`](#walwith_store--walwith_store_and_config)
 - [Errors](#errors)
   - [`WalError`](#walerror)
@@ -564,6 +566,33 @@ let wal = Wal::open_with(&path, config)?;
 # }
 ```
 
+### `Wal::open_segmented`
+
+```rust
+pub fn open_segmented(dir: impl AsRef<Path>, segment_size: u64) -> Result<Wal<SegmentedStore>>
+pub fn open_segmented_with(dir: impl AsRef<Path>, segment_size: u64, config: WalConfig) -> Result<Wal<SegmentedStore>>
+```
+
+Open a log striped across fixed-size segment files in `dir` (created if needed)
+instead of a single file — see [`SegmentedStore`](#segmentedstore). The log is
+still one continuous byte stream, so everything else behaves identically;
+`open_segmented_with` additionally applies a [`WalConfig`](#walconfig).
+
+**Returns** a `Wal<SegmentedStore>`, or [`WalError::Io`](#walerror) if
+`segment_size` is zero or the directory cannot be opened or scanned.
+
+```rust
+use wal_db::Wal;
+
+# fn main() -> Result<(), wal_db::WalError> {
+# let dir = tempfile::tempdir().map_err(wal_db::WalError::from)?;
+let wal = Wal::open_segmented(dir.path(), 16 * 1024 * 1024)?; // 16 MiB segments
+wal.append(b"record")?;
+wal.sync()?;
+# Ok(())
+# }
+```
+
 <hr>
 <br>
 <a href="#top">&uarr; <b>TOP</b></a>
@@ -703,6 +732,51 @@ assert_eq!(wal.iter()?.count(), 1);
 # }
 ```
 
+### `SegmentedStore`
+
+Source: `src/segment.rs`
+
+```rust
+pub struct SegmentedStore { /* private */ }
+
+impl SegmentedStore {
+    pub fn open(dir: impl AsRef<Path>, segment_size: u64) -> Result<Self>;
+    pub fn dir(&self) -> &Path;
+    pub fn segment_size(&self) -> u64;
+}
+```
+
+A `WalStore` that stripes one continuous byte space across fixed-size segment
+files in a directory (`00000000000000000000.wal`, `…01.wal`, …). A write or read
+that crosses a boundary is split across the two files, so records span segments
+freely — the same scheme PostgreSQL's WAL uses. Bounded files keep recovery time
+bounded and let old, fully superseded segments be archived or pruned. Segments
+are created lazily as the log grows, and `sync` flushes only the segments with
+unwritten changes.
+
+Because the address space stays contiguous, a `Wal` over a `SegmentedStore`
+behaves identically to one over a single file. Use it through
+[`Wal::open_segmented`](#walopen_segmented), or construct it directly for
+composition:
+
+```rust
+use wal_db::{SegmentedStore, Wal};
+
+# fn main() -> Result<(), wal_db::WalError> {
+# let dir = tempfile::tempdir().map_err(wal_db::WalError::from)?;
+let store = SegmentedStore::open(dir.path(), 1024 * 1024)?; // 1 MiB segments
+assert_eq!(store.segment_size(), 1024 * 1024);
+let wal = Wal::with_store(store)?;
+let big = vec![0u8; 4096]; // larger than nothing here, but a record may span segments
+wal.append(&big)?;
+wal.sync()?;
+# Ok(())
+# }
+```
+
+The byte-level segment layout is specified in
+[`docs/ON_DISK_FORMAT.md`](./ON_DISK_FORMAT.md).
+
 ### `Wal::with_store` / `Wal::with_store_and_config`
 
 ```rust
@@ -838,10 +912,10 @@ recovery already knows as it scans. A torn write leaves either too few bytes to
 form a record or a payload that no longer matches the checksum; recovery detects
 both and stops.
 
-> **Frozen for 1.x as of 0.3.0.** The full normative specification, including the
-> exact CRC parameters and the recovery algorithm, is in
-> [`docs/ON_DISK_FORMAT.md`](./ON_DISK_FORMAT.md). The multi-file segment layout
-> is added in 0.3.1.
+> **Frozen for 1.x.** The full normative specification — the exact CRC
+> parameters, the recovery algorithm, and the segment-file layout — is in
+> [`docs/ON_DISK_FORMAT.md`](./ON_DISK_FORMAT.md). The record format froze in
+> 0.3.0 and the segment layout in 0.3.1.
 
 <hr>
 <br>

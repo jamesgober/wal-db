@@ -138,6 +138,56 @@ impl Wal<FileStore> {
     }
 }
 
+#[cfg(not(loom))]
+impl Wal<crate::segment::SegmentedStore> {
+    /// Open a segmented log in directory `dir`, with segments of `segment_size`
+    /// bytes, creating the directory if needed.
+    ///
+    /// The log is one continuous byte stream striped across fixed-size files, so
+    /// it behaves exactly like a single-file log — records span segment
+    /// boundaries freely — while keeping each file bounded for recovery and
+    /// archival. Records larger than a segment simply occupy several.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WalError::Io`] if `segment_size` is zero or the directory cannot
+    /// be opened or scanned.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use wal_db::Wal;
+    /// # fn main() -> Result<(), wal_db::WalError> {
+    /// # let dir = tempfile::tempdir().map_err(wal_db::WalError::from)?;
+    /// let wal = Wal::open_segmented(dir.path(), 16 * 1024 * 1024)?; // 16 MiB segments
+    /// wal.append(b"record")?;
+    /// wal.sync()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn open_segmented(dir: impl AsRef<Path>, segment_size: u64) -> Result<Self> {
+        Self::open_segmented_with(dir, segment_size, WalConfig::new())
+    }
+
+    /// Open a segmented log with an explicit [`WalConfig`].
+    ///
+    /// Like [`open_segmented`](Wal::open_segmented), but applies `config` (for
+    /// example a tighter [`max_record_size`](WalConfig::max_record_size)).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WalError::Io`] if `segment_size` is zero or the directory cannot
+    /// be opened or scanned.
+    pub fn open_segmented_with(
+        dir: impl AsRef<Path>,
+        segment_size: u64,
+        config: WalConfig,
+    ) -> Result<Self> {
+        let store = crate::segment::SegmentedStore::open(dir, segment_size)?;
+        Self::with_store_and_config(store, config)
+    }
+}
+
 impl<S: WalStore> Wal<S> {
     /// Build a log over a custom [`WalStore`], using the default configuration.
     ///
