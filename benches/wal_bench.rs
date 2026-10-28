@@ -9,6 +9,10 @@
 //! - `commit/group/filestore` — many writers each append-and-sync, so their
 //!   fsyncs coalesce. This is the number that matters for a real workload, and
 //!   where group commit earns its place.
+//! - `recovery/strict_torn_tail` — opening a log whose last record is torn,
+//!   leaving a tail of random bytes (a torn record of ciphertext, say), under
+//!   each open policy. The strict policy scans the tail for intact records
+//!   before cutting it; the default cuts it unread.
 //!
 //! Run with `cargo bench`. These establish the baselines later optimisation
 //! milestones are measured against; a regression beyond the tracked threshold
@@ -20,7 +24,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
-use wal_db::{MemStore, Wal};
+use wal_db::{MemStore, OpenPolicy, Wal, WalConfig};
 
 /// A representative record payload.
 const PAYLOAD: &[u8] = &[0x5A; 256];
@@ -186,6 +190,61 @@ fn bench_recovery(c: &mut Criterion) {
     group.finish();
 }
 
+/// Deterministic random bytes (xorshift).
+fn noise(len: usize) -> Vec<u8> {
+    let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+    let mut out = Vec::with_capacity(len + 8);
+    while out.len() < len {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        out.extend_from_slice(&seed.to_le_bytes());
+    }
+    out.truncate(len);
+    out
+}
+
+fn bench_strict_torn_tail(c: &mut Criterion) {
+    let mut group = c.benchmark_group("recovery/strict_torn_tail");
+    group.sample_size(10);
+    for tail in [64 * 1024, 1024 * 1024, 16 * 1024 * 1024] {
+        // 1000 intact records, then a torn record: a header that claims more
+        // payload than follows it, and `tail` bytes of random payload.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("torn.wal");
+        {
+            let wal = Wal::open(&path).expect("open log");
+            for _ in 0..1000 {
+                let _ = wal.append(PAYLOAD).expect("append");
+            }
+            wal.sync().expect("sync");
+        }
+        let mut image = std::fs::read(&path).expect("read log");
+        image.extend_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+        image.extend_from_slice(&((tail + 1) as u32).to_le_bytes());
+        image.extend_from_slice(&noise(tail));
+
+        group.throughput(Throughput::Bytes(tail as u64));
+        for (name, policy) in [
+            ("truncate_tail", OpenPolicy::TruncateTail),
+            ("strict", OpenPolicy::Strict),
+        ] {
+            let config = WalConfig::new().with_open_policy(policy);
+            group.bench_function(format!("{name}/{}KiB", tail / 1024), |b| {
+                b.iter_batched(
+                    || MemStore::from_bytes(image.clone()),
+                    |store| {
+                        let wal = Wal::with_store_and_config(store, config).expect("open");
+                        black_box(wal.truncated_on_open());
+                    },
+                    BatchSize::LargeInput,
+                );
+            });
+        }
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_reservation,
@@ -194,6 +253,7 @@ criterion_group!(
     bench_append_multi_filestore,
     bench_commit_single,
     bench_commit_group,
-    bench_recovery
+    bench_recovery,
+    bench_strict_torn_tail
 );
 criterion_main!(benches);

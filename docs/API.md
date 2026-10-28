@@ -18,8 +18,9 @@
 
 > Complete reference for every public item in `wal-db`, with runnable examples.
 >
-> **Status: stable (`1.0`).** Every item below is frozen until `2.0`; the on-disk
-> format is frozen for the 1.x line. See
+> **Status: stable (`1.1`).** Every item below is frozen until `2.0`; the on-disk
+> format is frozen for the 1.x line. 1.1 adds `OpenPolicy` and
+> `Wal::truncated_on_open`. See
 > [`docs/ON_DISK_FORMAT.md`](./ON_DISK_FORMAT.md).
 
 <a id="top"></a>
@@ -39,12 +40,14 @@
   - [`Wal::truncate_after`](#waltruncate_after)
   - [`Wal::truncate_before`](#waltruncate_before)
   - [`Wal::len` / `Wal::is_empty`](#wallen--walis_empty)
+  - [`Wal::truncated_on_open`](#waltruncated_on_open)
   - [`Lsn`](#lsn)
   - [`Record`](#record)
   - [`WalIter`](#waliter-type)
 - [Tier 2 — configuration](#tier-2--configuration)
   - [`WalConfig`](#walconfig)
   - [`RecoveryPolicy`](#recoverypolicy)
+  - [`OpenPolicy`](#openpolicy)
   - [`Wal::open_with`](#walopen_with)
   - [`Wal::open_segmented`](#walopen_segmented)
 - [Tier 3 — custom backends](#tier-3--custom-backends)
@@ -73,7 +76,7 @@ The API is layered:
 | Tier | Surface | For |
 |------|---------|-----|
 | 1 | `Wal::open` / `append` / `sync` / `iter` (+ `append_and_sync`, `append_typed`, `iter_from`, `truncate_after`) | the common case — four calls, no generics to name |
-| 2 | `WalConfig`, `RecoveryPolicy`, `Wal::open_with`, `Wal::open_segmented` | tuning record limits, recovery policy, segment rotation |
+| 2 | `WalConfig`, `RecoveryPolicy`, `OpenPolicy`, `Wal::open_with`, `Wal::open_segmented` | tuning record limits, recovery and open policy, segment rotation |
 | 3 | `WalStore`, `FileStore`, `MemStore`, `SegmentedStore`, `Wal::with_store` | custom and segmented storage backends |
 
 Durability is explicit: `append` returns when the record is buffered in the OS
@@ -89,10 +92,10 @@ iterator-based and stops at the first torn or corrupt record.
 
 ```toml
 [dependencies]
-wal-db = "1.0"
+wal-db = "1.1"
 
 # Typed records via pack-io:
-wal-db = { version = "1.0", features = ["pack-io"] }
+wal-db = { version = "1.1", features = ["pack-io"] }
 ```
 
 The default feature set is empty; the crate is standard-library only.
@@ -130,6 +133,12 @@ or fails its checksum, and truncates that torn tail so the next append lands on 
 clean boundary. The usual cause of a torn tail is a crash partway through an
 earlier append; that record was never acknowledged durable, so discarding it
 loses nothing the caller was promised.
+
+Damage in the middle of the log (bit rot) is cut the same way, along with the
+intact records after it. To refuse that instead, open with
+[`OpenPolicy::Strict`](#openpolicy) through [`Wal::open_with`](#walopen_with).
+[`Wal::truncated_on_open`](#waltruncated_on_open) reports how many bytes were
+cut.
 
 **Parameters**
 
@@ -575,6 +584,40 @@ assert!(wal.len() > 0);
 # }
 ```
 
+### `Wal::truncated_on_open`
+
+```rust
+pub fn truncated_on_open(&self) -> u64
+```
+
+How many bytes opening the log cut from its end (since 1.1). Zero when the log
+opened clean. Under [`OpenPolicy::Strict`](#openpolicy) a non-zero value is only
+ever a torn tail. Under the default `OpenPolicy::TruncateTail` it can also
+include intact records that followed damage in the middle of the log; a consumer
+that knows how much it last made durable can compare.
+
+```rust
+use std::io::Write;
+use wal_db::{Wal, WalError};
+
+# fn main() -> Result<(), WalError> {
+# let dir = tempfile::tempdir().map_err(WalError::from)?;
+# let path = dir.path().join("app.wal");
+let wal = Wal::open(&path)?;
+wal.append_and_sync(b"kept")?;
+drop(wal);
+
+// Five stray bytes after the last record: a torn tail.
+let mut file = std::fs::OpenOptions::new().append(true).open(&path)?;
+file.write_all(&[0xAB; 5])?;
+drop(file);
+
+let wal = Wal::open(&path)?;
+assert_eq!(wal.truncated_on_open(), 5);
+# Ok(())
+# }
+```
+
 ### `Lsn`
 
 Source: `src/lsn.rs`
@@ -685,6 +728,8 @@ impl WalConfig {
     pub const fn max_record_size(self) -> u32;
     pub const fn with_recovery_policy(self, policy: RecoveryPolicy) -> Self;
     pub const fn recovery_policy(self) -> RecoveryPolicy;
+    pub const fn with_open_policy(self, policy: OpenPolicy) -> Self;   // since 1.1
+    pub const fn open_policy(self) -> OpenPolicy;                     // since 1.1
 }
 ```
 
@@ -701,6 +746,9 @@ request.
 
 **`recovery_policy`** — how iteration reacts to a damaged record; see
 [`RecoveryPolicy`](#recoverypolicy). Defaults to `StopAtFirstError`.
+
+**`open_policy`** — what opening the log does with damage it finds; see
+[`OpenPolicy`](#openpolicy). Defaults to `TruncateTail`.
 
 ```rust
 use wal_db::{RecoveryPolicy, WalConfig};
@@ -729,14 +777,82 @@ pub enum RecoveryPolicy {
 ```
 
 How [`Wal::iter`](#waliter) reacts to a damaged record. This governs
-*iteration*, not the torn-tail truncation [`Wal::open`](#walopen) always performs
-to keep the append boundary clean — it matters when a record in the middle of an
-already-recovered log is damaged (bit rot, say).
+*iteration*, not what [`Wal::open`](#walopen) does with damage it finds while
+opening (that is [`OpenPolicy`](#openpolicy)) — it matters when a record in the
+middle of an already-recovered log is damaged (bit rot, say).
 
 | Variant | Behaviour |
 |---------|-----------|
 | `StopAtFirstError` (default) | Yield the damaged record as a single [`WalError::Corruption`](#walerror), then end. Right for an append-only log, where a damaged record means everything after it is suspect. |
 | `SkipBadRecords` | Yield the damage as a [`WalError::Corruption`](#walerror) — never silently — then resume at the next record. For forensic / partial recovery. Only works while the damaged record's length prefix is intact enough to locate the next one; an unreadable length still stops iteration. |
+
+### `OpenPolicy`
+
+Source: `src/config.rs` (since 1.1)
+
+```rust
+#[non_exhaustive]
+pub enum OpenPolicy {
+    TruncateTail,
+    Strict,
+}
+```
+
+What opening a log does when its scan stops before the end of the store, at a
+record that is incomplete or fails its checksum. The common cause is a torn tail
+from a crash mid-append: a final record never acknowledged durable, safe to cut.
+The other cause is damage in the middle of the log (bit rot, a bad sector, a
+missing segment file), where the records after the damage are intact and were
+acknowledged; cutting them loses committed data.
+
+| Variant | Behaviour |
+|---------|-----------|
+| `TruncateTail` (default) | Cut everything from the first damaged record to the end, then open. The 1.0 behaviour. Mid-log damage is cut together with every intact record after it. |
+| `Strict` | Cut a damaged final record, but refuse to open if intact data follows the damage: open returns [`WalError::Corruption`](#walerror) at the damaged record's offset and the store is not modified. Also refuses when the store cannot read back bytes it reports holding (a missing segment file, or segments below a head marker that was lost), and when the record the scan stopped at is intact but longer than `max_record_size` (a log written with a larger limit). |
+
+How `Strict` decides: every byte offset after the damage is tried as the start of
+a record (a full header, a length within `max_record_size`, the whole payload
+present, a matching checksum). Every offset is tried because the damage may be in
+the length field, which leaves the next record's position unknown.
+
+When `Strict` refuses a log that was only torn: the check cannot tell damage from
+a crash that left a later record complete behind an incomplete earlier one, which
+happens when several appends are in flight together (concurrent appenders, or
+several appends before one sync, with write-back persisting them out of order).
+It is exact for a log written one record at a time, each made durable before the
+next is appended. Two rarer cases also refuse: a torn record whose payload itself
+contains a framed record, and random bytes matching a checksum by chance (about
+one in 2^32 per offset whose length field is plausible). Every refusal fails
+closed; reopening with `TruncateTail` after inspection cuts as before.
+
+Cost: nothing on a log that opens clean. With damage, one pass over the bytes
+after it plus a checksum per offset with a plausible length. Candidates that fit
+a 64 KiB window are checksummed from it; longer ones are checked from prefix
+checksums kept every 4 KiB, so a candidate's cost does not grow with its length.
+Memory: the window plus 4 bytes per 4 KiB scanned. Measured numbers are in
+[`docs/BENCHMARKS.md`](./BENCHMARKS.md).
+
+```rust
+use wal_db::{OpenPolicy, Wal, WalConfig, WalError};
+
+# fn main() -> Result<(), WalError> {
+# let dir = tempfile::tempdir().map_err(WalError::from)?;
+# let path = dir.path().join("app.wal");
+let config = WalConfig::new().with_open_policy(OpenPolicy::Strict);
+match Wal::open_with(&path, config) {
+    Ok(wal) => {
+        // Intact, or only a torn tail was cut.
+        let _ = wal.truncated_on_open();
+    }
+    Err(WalError::Corruption { offset, reason }) => {
+        // Intact data follows damage at `offset`. Nothing was cut.
+        eprintln!("refusing to open: {reason} at {offset}");
+    }
+    Err(other) => return Err(other),
+}
+# Ok(())
+# }
+```
 
 ### `Wal::open_with`
 
@@ -1034,7 +1150,7 @@ arm.
 |---------|---------|------------|
 | `Io` | An underlying I/O operation failed; `context` names the operation, `source` is the original `io::Error`. | Inspect `source` for the kind (disk full, permission denied). After an append error, reopen the log. |
 | `RecordTooLarge` | The record exceeds [`max_record_size`](#walconfig). The log is unchanged. | Split the payload or raise the limit. |
-| `Corruption` | Recovery reached a record that is incomplete or fails its checksum, at byte `offset`. | Everything after `offset` is untrustworthy; stop and investigate. `is_fatal()` returns `true`. |
+| `Corruption` | Recovery reached a record that is incomplete or fails its checksum, at byte `offset`. Also returned by open under [`OpenPolicy::Strict`](#openpolicy) when intact data follows a damaged record at `offset`; nothing is cut. | Everything after `offset` is untrustworthy; stop and investigate. `is_fatal()` returns `true`. |
 | `Encoding` | A typed record (the `pack-io` feature) failed to encode or decode; `detail` is the codec error's message. | Check the value or the type being decoded into. |
 
 ```rust
@@ -1075,7 +1191,8 @@ use wal_db::prelude::*;
 ```
 
 Re-exports the four-call API and the types its methods return: `Wal`, `Lsn`,
-`Record`, `WalConfig`, `RecoveryPolicy`, `WalStore`, `WalError`, and `Result`.
+`Record`, `WalConfig`, `RecoveryPolicy`, `OpenPolicy`, `WalStore`, `WalError`,
+and `Result`.
 Enough for the great majority of uses.
 
 ```rust

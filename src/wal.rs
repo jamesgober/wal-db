@@ -8,11 +8,12 @@ use std::{cell::RefCell, path::Path};
 
 use crate::{
     commit::Commit,
-    config::{RecoveryPolicy, WalConfig},
+    config::{OpenPolicy, RecoveryPolicy, WalConfig},
     error::{Result, WalError},
     lsn::Lsn,
     record::{self, HEADER_LEN},
     store::{FileStore, WalStore},
+    strict::{self, Tail},
     sync::AtomicU64,
 };
 
@@ -83,6 +84,8 @@ pub struct Wal<S = FileStore> {
     /// [`truncate_before`](Wal::truncate_before).
     head: AtomicU64,
     commit: Commit,
+    /// Bytes the open scan cut from the end of the store.
+    truncated_on_open: u64,
 }
 
 #[cfg(not(loom))]
@@ -94,7 +97,10 @@ impl Wal<FileStore> {
     /// next append lands on a clean boundary. The common cause of a torn tail is
     /// a crash partway through an earlier append; that record was never
     /// acknowledged durable, so discarding it loses nothing the caller was
-    /// promised.
+    /// promised. Damage in the middle of the log is cut the same way, with the
+    /// intact records after it; to refuse that instead, open with
+    /// [`OpenPolicy::Strict`] through [`open_with`](Wal::open_with).
+    /// [`truncated_on_open`](Wal::truncated_on_open) reports what was cut.
     ///
     /// # Errors
     ///
@@ -121,7 +127,9 @@ impl Wal<FileStore> {
     ///
     /// # Errors
     ///
-    /// Returns [`WalError::Io`] if the file cannot be opened or scanned.
+    /// - [`WalError::Io`] if the file cannot be opened or scanned.
+    /// - [`WalError::Corruption`] under [`OpenPolicy::Strict`], when intact data
+    ///   follows a damaged record. Nothing is cut.
     ///
     /// # Examples
     ///
@@ -180,8 +188,10 @@ impl Wal<crate::segment::SegmentedStore> {
     ///
     /// # Errors
     ///
-    /// Returns [`WalError::Io`] if `segment_size` is zero or the directory cannot
-    /// be opened or scanned.
+    /// - [`WalError::Io`] if `segment_size` is zero or the directory cannot be
+    ///   opened or scanned.
+    /// - [`WalError::Corruption`] under [`OpenPolicy::Strict`], when intact data
+    ///   follows a damaged record. Nothing is cut.
     pub fn open_segmented_with(
         dir: impl AsRef<Path>,
         segment_size: u64,
@@ -217,7 +227,9 @@ impl<S: WalStore> Wal<S> {
     ///
     /// # Errors
     ///
-    /// Returns an error if scanning the existing contents of the store fails.
+    /// - Any error the store returns while its existing contents are scanned.
+    /// - [`WalError::Corruption`] under [`OpenPolicy::Strict`], when intact data
+    ///   follows a damaged record. Nothing is cut.
     ///
     /// # Examples
     ///
@@ -232,15 +244,56 @@ impl<S: WalStore> Wal<S> {
     /// ```
     pub fn with_store_and_config(store: S, config: WalConfig) -> Result<Self> {
         let head = store.head()?;
-        let recovered = recover(&store, config.max_record_size(), head)?;
+        let recovered = recover(&store, &config, head)?;
         Ok(Wal {
-            tail: CacheAligned(AtomicU64::new(recovered)),
+            tail: CacheAligned(AtomicU64::new(recovered.end)),
             store,
             max_record_size: config.max_record_size(),
             recovery_policy: config.recovery_policy(),
             head: AtomicU64::new(head),
-            commit: Commit::new(recovered),
+            commit: Commit::new(recovered.end),
+            truncated_on_open: recovered.cut,
         })
+    }
+
+    /// How many bytes opening the log cut from its end.
+    ///
+    /// Zero when the log opened clean. Otherwise the open scan stopped at an
+    /// incomplete or damaged record and cut it and everything after it, as the
+    /// configured [`OpenPolicy`] allowed. Under
+    /// [`OpenPolicy::Strict`] a non-zero value is only ever a torn tail. Under
+    /// the default [`OpenPolicy::TruncateTail`] it can also include intact
+    /// records that followed damage in the middle of the log; a consumer that
+    /// knows how much it last made durable can compare.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::Write;
+    /// use wal_db::{Wal, WalError};
+    ///
+    /// # fn main() -> Result<(), WalError> {
+    /// # let dir = tempfile::tempdir().map_err(WalError::from)?;
+    /// # let path = dir.path().join("log.wal");
+    /// let wal = Wal::open(&path)?;
+    /// assert_eq!(wal.truncated_on_open(), 0); // a new log has nothing to cut
+    /// wal.append_and_sync(b"kept")?;
+    /// drop(wal);
+    ///
+    /// // Five stray bytes after the last record: a torn tail.
+    /// let mut file = std::fs::OpenOptions::new().append(true).open(&path)?;
+    /// file.write_all(&[0xAB; 5])?;
+    /// drop(file);
+    ///
+    /// let wal = Wal::open(&path)?;
+    /// assert_eq!(wal.truncated_on_open(), 5);
+    /// assert_eq!(wal.iter()?.count(), 1);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn truncated_on_open(&self) -> u64 {
+        self.truncated_on_open
     }
 
     /// Append `record` to the log and return the [`Lsn`] it was assigned — the
@@ -318,7 +371,11 @@ impl<S: WalStore> Wal<S> {
     /// Returns [`WalError::Io`] if the flush fails, or [`WalError::Corruption`]
     /// if an earlier append's write failed and left a gap that cannot be made
     /// durable. A failed sync means the records are not durable; treat it as
-    /// fatal, not as something to retry blindly.
+    /// fatal, not as something to retry blindly. The log does not remember the
+    /// failure: a later `sync` can return `Ok` although the operating system may
+    /// have dropped the pages the failed flush did not write. After a failed
+    /// sync, stop appending and reopen the log, so recovery decides what
+    /// survived.
     ///
     /// # Examples
     ///
@@ -670,9 +727,23 @@ fn with_frame_buffer<R>(f: impl FnOnce(&mut Vec<u8>) -> R) -> R {
     f(&mut buf)
 }
 
-/// Scan a store from the start, returning the end offset of the last intact
-/// record and truncating any torn tail beyond it.
-fn recover<S: WalStore>(store: &S, max_record_size: u32, head: u64) -> Result<u64> {
+/// What the open scan recovered.
+#[derive(Debug, Clone, Copy)]
+struct Recovered {
+    /// End offset of the last intact record: where the next append lands.
+    end: u64,
+    /// Bytes cut from the store past `end`.
+    cut: u64,
+}
+
+/// Scan a store from the head, returning the end offset of the last intact
+/// record and cutting whatever follows it, as `config`'s [`OpenPolicy`] allows.
+///
+/// Under [`OpenPolicy::Strict`] a cut is made only when nothing intact follows
+/// the damage; otherwise the store is left untouched and the damaged record's
+/// offset is returned as [`WalError::Corruption`].
+fn recover<S: WalStore>(store: &S, config: &WalConfig, head: u64) -> Result<Recovered> {
+    let max_record_size = config.max_record_size();
     let physical = store.len()?;
     // Scan from the head: a log whose prefix was dropped no longer starts at 0.
     let mut offset: u64 = head;
@@ -711,9 +782,35 @@ fn recover<S: WalStore>(store: &S, max_record_size: u32, head: u64) -> Result<u6
     }
 
     if offset < physical {
+        if config.open_policy() == OpenPolicy::Strict {
+            match strict::classify(store, max_record_size, offset, physical)? {
+                Tail::Torn => {}
+                Tail::IntactAfter => {
+                    return Err(WalError::corruption(
+                        offset,
+                        "intact data follows a damaged record",
+                    ));
+                }
+                Tail::Unreadable => {
+                    return Err(WalError::corruption(
+                        offset,
+                        "the log cannot be read to its end after a damaged record",
+                    ));
+                }
+                Tail::Oversized => {
+                    return Err(WalError::corruption(
+                        offset,
+                        "an intact record is longer than max_record_size",
+                    ));
+                }
+            }
+        }
         store.truncate(offset)?;
     }
-    Ok(offset)
+    Ok(Recovered {
+        end: offset,
+        cut: physical.saturating_sub(offset),
+    })
 }
 
 impl<S: WalStore> fmt::Debug for Wal<S> {

@@ -85,6 +85,12 @@
 //! can never trigger an unbounded allocation: lengths are validated against
 //! [`WalConfig::max_record_size`] before a single byte of payload is read.
 //!
+//! By default the open scan cuts everything from the first damaged record on,
+//! which also cuts intact records that follow damage in the middle of the log.
+//! [`OpenPolicy::Strict`] refuses to open in that case instead, returning
+//! [`WalError::Corruption`] with the store untouched, and still cuts a damaged
+//! final record. [`Wal::truncated_on_open`] reports how many bytes were cut.
+//!
 //! ## Backends
 //!
 //! [`Wal::open`] uses the file-backed [`FileStore`]. Custom backends — in-memory
@@ -122,10 +128,11 @@ mod lsn;
 mod record;
 mod segment;
 mod store;
+mod strict;
 mod sync;
 mod wal;
 
-pub use crate::config::{RecoveryPolicy, WalConfig};
+pub use crate::config::{OpenPolicy, RecoveryPolicy, WalConfig};
 pub use crate::error::{Result, WalError};
 pub use crate::lsn::Lsn;
 pub use crate::segment::SegmentedStore;
@@ -159,7 +166,7 @@ pub use pack_io;
 /// # }
 /// ```
 pub mod prelude {
-    pub use crate::config::{RecoveryPolicy, WalConfig};
+    pub use crate::config::{OpenPolicy, RecoveryPolicy, WalConfig};
     pub use crate::error::{Result, WalError};
     pub use crate::lsn::Lsn;
     pub use crate::store::WalStore;

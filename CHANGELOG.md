@@ -18,6 +18,54 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [1.1.0] - 2026-10-28
+
+An opt-in strict open, so a consumer can fail closed on damage in the middle of
+the log. Additive: the default behaviour, the API from 1.0, and the on-disk format
+are unchanged.
+
+### Added
+
+- **`OpenPolicy`** and **`WalConfig::with_open_policy` / `open_policy`.** What
+  opening a log does when its scan stops at a damaged or incomplete record.
+  `OpenPolicy::TruncateTail` (the default) cuts everything from that record on,
+  as every 1.0 release does. `OpenPolicy::Strict` cuts it only when nothing
+  after it is an intact record: if an intact record follows the damage, or the
+  store cannot read back bytes it reports holding (a missing segment file), the
+  open fails with `WalError::Corruption` at the damaged record's offset and the
+  store is not modified. It also refuses an intact record whose length is above
+  the configured `max_record_size` (a log written with a larger limit) instead
+  of cutting it as a torn tail. A damaged or incomplete final record (a torn
+  tail) is still cut. `OpenPolicy` is `#[non_exhaustive]` and is in the prelude.
+- **`Wal::truncated_on_open`.** How many bytes the open scan cut from the end of
+  the log; zero when it opened clean.
+- Tests: `tests/strict_open.rs` (torn tail cut under both policies, mid-log
+  damage in the payload, length, and checksum fields refused under strict with
+  the file unchanged, the default still cutting, segmented logs including a
+  missing segments and a lost head marker after prefix compaction, a record
+  above a lowered `max_record_size`, and property tests over random truncation
+  points and random single-byte damage). The fuzz target also opens under the
+  strict policy.
+- Benchmark `recovery/strict_torn_tail` (64 KiB, 1 MiB, and 16 MiB torn tails of
+  random bytes under each policy); numbers in `docs/BENCHMARKS.md`.
+
+### Notes
+
+- Strict open checks every byte offset after the damage as a possible record
+  start, because damage to a length field leaves the next record's position
+  unknown. Candidates longer than the 64 KiB read window are checked from prefix
+  checksums, so one candidate's cost does not grow with its length. There is no
+  cost on a log that opens clean.
+- Strict open cannot tell damage from a crash that left a later record complete
+  behind an incomplete earlier one (several appends in flight at once). It is
+  exact for a log written one record at a time, each made durable before the
+  next; otherwise such a crash makes it refuse, and reopening with the default
+  policy cuts as before.
+- `Wal::sync` documents that a failed sync is not remembered: a later sync can
+  return `Ok` without the earlier data being durable, so reopen after a failure.
+
+---
+
 ## [1.0.0] - 2026-06-05
 
 First stable release. The public API is now frozen until 2.0, and the on-disk
@@ -448,7 +496,8 @@ Initial scaffold and repository bootstrap. No WAL logic yet — this release est
 - `.gitattributes` normalising line endings and excluding development paths from archives.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) — gitignored.
 
-[Unreleased]: https://github.com/jamesgober/wal-db/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/jamesgober/wal-db/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/jamesgober/wal-db/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/jamesgober/wal-db/compare/v0.9.1...v1.0.0
 [0.9.1]: https://github.com/jamesgober/wal-db/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/jamesgober/wal-db/compare/v0.8.0...v0.9.0

@@ -32,7 +32,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). Lock-free append. Group commit. Explicit fsync. Crash-safe recovery.
     </p>
     <blockquote>
-        <strong>Status: <code>1.0</code> — stable.</strong> The public API is frozen until <code>2.0</code> and the <a href="./docs/ON_DISK_FORMAT.md">on-disk format</a> is frozen for the 1.x line. Full feature set — lock-free append, group commit, segment rotation, suffix and prefix compaction — hardened with a fuzz harness, loom model checks, adversarial recovery tests, injected I/O-failure tests, and property tests, and measured against a hand-rolled WAL (<a href="./docs/BENCHMARKS.md">benchmarks</a>). See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for detail.
+        <strong>Status: <code>1.1</code> — stable.</strong> The public API is frozen until <code>2.0</code> (1.1 adds an opt-in strict open) and the <a href="./docs/ON_DISK_FORMAT.md">on-disk format</a> is frozen for the 1.x line. Full feature set — lock-free append, group commit, segment rotation, suffix and prefix compaction — hardened with a fuzz harness, loom model checks, adversarial recovery tests, injected I/O-failure tests, and property tests, and measured against a hand-rolled WAL (<a href="./docs/BENCHMARKS.md">benchmarks</a>). See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for detail.
     </blockquote>
 </div>
 
@@ -51,6 +51,7 @@
 - **Self-healing recovery** — a torn tail from a crash mid-append is truncated on open, leaving a clean boundary
 - **Fuzz-hardened recovery** — arbitrary bytes never panic or over-allocate; a continuous `cargo-fuzz` harness proves it
 - **Recovery policies** — stop at the first damaged record, or skip past it for forensic partial recovery
+- **Strict open (optional)** — refuse to open, leaving the log untouched, when intact records follow a damaged one, instead of cutting them; a damaged final record is still cut
 - **LSN seeking & truncation** — replay from any LSN (`iter_from`); drop everything after one (`truncate_after`) or, on a segmented log, reclaim everything before one (`truncate_before`) for compaction
 - **Iterator-based replay** — walk the log forward to rebuild state
 - **Typed records (optional)** — serialise any value via `pack-io` behind a feature; the byte-record API is unchanged when off
@@ -79,7 +80,7 @@ That flush is not the same call on every platform, and getting it wrong is silen
 
 ```toml
 [dependencies]
-wal-db = "1.0"
+wal-db = "1.1"
 ```
 
 <br>
@@ -131,6 +132,30 @@ for entry in wal.iter()? {
 # Ok(())
 # }
 ```
+
+### Strict open
+
+By default the open scan cuts everything from the first damaged record on. When the damage is in the middle of the log (bit rot, a bad sector, a missing segment file), that also cuts intact records after it. `OpenPolicy::Strict` refuses to open in that case, returning `WalError::Corruption` at the damaged record's offset with the log unchanged, and still cuts a damaged final record. `Wal::truncated_on_open` reports how many bytes an open cut, under either policy.
+
+```rust
+use wal_db::{OpenPolicy, Wal, WalConfig, WalError};
+
+# fn main() -> Result<(), WalError> {
+# let dir = tempfile::tempdir().map_err(WalError::from)?;
+# let path = dir.path().join("app.wal");
+let config = WalConfig::new().with_open_policy(OpenPolicy::Strict);
+match Wal::open_with(&path, config) {
+    Ok(wal) => println!("opened; cut {} torn bytes", wal.truncated_on_open()),
+    Err(WalError::Corruption { offset, reason }) => {
+        eprintln!("refusing to open: {reason} at {offset}"); // nothing was cut
+    }
+    Err(other) => return Err(other),
+}
+# Ok(())
+# }
+```
+
+Strict open is exact for a log written one record at a time, each made durable before the next is appended. With several appends in flight at a crash, a later record can survive behind an incomplete earlier one; strict open cannot tell that from damage and refuses. See the [`OpenPolicy` reference](./docs/API.md#openpolicy) for the detail and the cost.
 
 <br>
 
@@ -233,7 +258,7 @@ By default a record is bytes. With the `pack-io` feature, a record can be any ty
 
 ```toml
 [dependencies]
-wal-db = { version = "1.0", features = ["pack-io"] }
+wal-db = { version = "1.1", features = ["pack-io"] }
 ```
 
 ```rust
@@ -257,7 +282,7 @@ assert_eq!(event, Event { id: 1, name: "start".into() });
 
 ## Recovery policies
 
-`Wal::open` always truncates a torn tail so the append boundary is clean. For corruption *inside* an already-recovered log — bit rot, say — a `WalConfig` recovery policy controls how iteration reacts:
+`Wal::open` cuts a torn tail so the append boundary is clean. For corruption *inside* an already-recovered log — bit rot, say — a `WalConfig` recovery policy controls how iteration reacts:
 
 ```rust
 use wal_db::{RecoveryPolicy, Wal, WalConfig};

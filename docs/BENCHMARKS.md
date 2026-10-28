@@ -26,7 +26,7 @@
 ## Running
 
 ```bash
-cargo bench --bench wal_bench   # append, commit, recovery, reservation
+cargo bench --bench wal_bench   # append, commit, recovery, strict open, reservation
 cargo bench --bench compare     # wal-db vs a hand-rolled inline WAL
 ```
 
@@ -63,6 +63,30 @@ records. Medians shown; see `target/criterion/` for the full distributions.
 - **Group commit is the throughput lever.** One fsync amortises over every commit
   in flight; the multiplier grows with more writers and faster storage. See the
   head-to-head below.
+
+## Strict open — 1.1.0
+
+`recovery/strict_torn_tail`: opening an in-memory log of 1000 intact 256-byte
+records followed by a torn record, a header claiming more payload than follows
+and a tail of random bytes (the worst case: random payload, such as ciphertext,
+gives many offsets a plausible length). Same machine and build as above, under
+load from other work, so read the figures as approximate. Medians.
+
+| Torn tail | `TruncateTail` (default) | `Strict` | Strict scan, per byte |
+|-----------|--------------------------|----------|-----------------------|
+| 64 KiB    | ~0.15 ms | ~0.33 ms | ~2.8 ns |
+| 1 MiB     | ~0.72 ms | ~4.9 ms  | ~4 ns   |
+| 16 MiB    | ~11 ms   | ~187 ms  | ~10.5 ns |
+
+- A log that opens clean pays nothing: the strict scan starts only once the
+  normal scan has stopped short of the end.
+- The per-byte cost rises with the tail because more offsets carry a plausible
+  length that runs past the read window; each of those is checked from prefix
+  checksums in a few microseconds, independent of its length. Checksumming each
+  of them directly would grow with the cube of the tail size.
+- A tail of zeros or of bytes whose length fields exceed `max_record_size` stays
+  at the low end. A smaller `max_record_size` shrinks the number of plausible
+  offsets.
 
 ## Head-to-head — `cargo bench --bench compare`
 
