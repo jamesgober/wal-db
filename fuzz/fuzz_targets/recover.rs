@@ -6,15 +6,19 @@
 //! deliberately small so a crafted length prefix is rejected before any payload
 //! allocation — the recovery scan validates every length against it before
 //! reading. Both recovery policies are exercised, including the skip path that
-//! advances using untrusted lengths.
+//! advances using untrusted lengths, and the strict open policy, whose scan
+//! after a damaged record tries every offset as a record start.
 
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use wal_db::{MemStore, RecoveryPolicy, Wal, WalConfig};
+use wal_db::{MemStore, OpenPolicy, RecoveryPolicy, Wal, WalConfig};
 
-fn drive(data: &[u8], policy: RecoveryPolicy) {
-    let config = WalConfig::new().with_max_record_size(1 << 16).with_recovery_policy(policy);
+fn drive(data: &[u8], policy: RecoveryPolicy, open: OpenPolicy) {
+    let config = WalConfig::new()
+        .with_max_record_size(1 << 16)
+        .with_recovery_policy(policy)
+        .with_open_policy(open);
     if let Ok(wal) = Wal::with_store_and_config(MemStore::from_bytes(data.to_vec()), config) {
         if let Ok(iter) = wal.iter() {
             for entry in iter {
@@ -25,6 +29,7 @@ fn drive(data: &[u8], policy: RecoveryPolicy) {
 }
 
 fuzz_target!(|data: &[u8]| {
-    drive(data, RecoveryPolicy::StopAtFirstError);
-    drive(data, RecoveryPolicy::SkipBadRecords);
+    drive(data, RecoveryPolicy::StopAtFirstError, OpenPolicy::TruncateTail);
+    drive(data, RecoveryPolicy::SkipBadRecords, OpenPolicy::TruncateTail);
+    drive(data, RecoveryPolicy::StopAtFirstError, OpenPolicy::Strict);
 });
