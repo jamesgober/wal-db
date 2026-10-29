@@ -18,7 +18,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
-## [1.1.0] - 2026-10-28
+## [1.1.0] - 2026-10-29
 
 An opt-in strict open, so a consumer can fail closed on damage in the middle of
 the log. Additive: the default behaviour, the API from 1.0, and the on-disk format
