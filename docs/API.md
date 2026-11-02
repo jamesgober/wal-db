@@ -262,7 +262,14 @@ once.
 **Returns** `Ok(())`, or [`WalError::Io`](#walerror) if the flush fails, or
 [`WalError::Corruption`](#walerror) if an earlier append's write failed and left a
 gap that cannot be made durable. A failed sync means the records are **not**
-durable; treat it as fatal, not as something to retry blindly.
+durable, and the failure is permanent for this handle: the operating system may
+have dropped the pages it could not write, so a retry could succeed without them.
+Every later sync covering anything not yet durable returns `WalError::Io`. Stop
+appending and reopen the log, so recovery decides what survived.
+
+`sync` also flushes the log's directory after a segment file is created or removed,
+and once per open, so a new file's name is as durable as its contents. That step is
+a no-op on Windows, where NTFS journals metadata.
 
 **Examples**
 

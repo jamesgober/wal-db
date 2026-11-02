@@ -18,6 +18,46 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [1.1.1] - 2026-11-02
+
+Durability fixes. No API or on-disk format change.
+
+### Fixed
+
+- **A torn `head` marker could cost a whole segmented log.** The marker was
+  rewritten in place, so a crash during `truncate_before` could leave it empty.
+  The head then fell back to 0, below the segments already dropped, and a default
+  open cut the log to nothing and deleted every segment. The marker is now written
+  to `head.tmp`, flushed, renamed over `head`, and the directory is flushed.
+- **New files were not durable until their directory was.** On Unix, flushing a
+  file does not make its name durable, so a power loss could lose a synced
+  segment. `sync` now flushes the directory after a segment file is created or
+  removed, and once per open for both store types, covering a new single-file log
+  and a new log directory. Removals matter too: a truncated segment that came back
+  after a power loss could bring truncated records with it.
+- **A failed flush could be followed by a false `Ok`.** After a failed `sync` the
+  operating system may have dropped the pages it could not write, so a retried
+  flush can succeed without them. Threads waiting on the failed flush also retried
+  it themselves. Now every thread gets the error, and every later `sync` covering
+  anything not yet durable returns `WalError::Io` until the log is reopened.
+
+### Changed
+
+- **Behaviour after a failed flush:** code that retried `sync` after an error and
+  could get `Ok` now keeps getting an error until it reopens the log. The docs have
+  always said to treat a failed sync as fatal.
+
+### Notes
+
+- Cost: one directory flush per new or removed segment and per open, inside `sync`,
+  never in `append`. The append path pays one atomic store per new segment.
+- Windows has no directory flush through the standard library, so that step is a
+  no-op there; NTFS commits metadata through its journal. A directory that cannot
+  be opened for lack of permission, or a filesystem that does not support the
+  flush, is skipped.
+
+---
+
 ## [1.1.0] - 2026-10-29
 
 An opt-in strict open, so a consumer can fail closed on damage in the middle of
@@ -496,7 +536,8 @@ Initial scaffold and repository bootstrap. No WAL logic yet — this release est
 - `.gitattributes` normalising line endings and excluding development paths from archives.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) — gitignored.
 
-[Unreleased]: https://github.com/jamesgober/wal-db/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/jamesgober/wal-db/compare/v1.1.1...HEAD
+[1.1.1]: https://github.com/jamesgober/wal-db/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/jamesgober/wal-db/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/jamesgober/wal-db/compare/v0.9.1...v1.0.0
 [0.9.1]: https://github.com/jamesgober/wal-db/compare/v0.9.0...v0.9.1

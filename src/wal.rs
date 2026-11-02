@@ -370,12 +370,11 @@ impl<S: WalStore> Wal<S> {
     ///
     /// Returns [`WalError::Io`] if the flush fails, or [`WalError::Corruption`]
     /// if an earlier append's write failed and left a gap that cannot be made
-    /// durable. A failed sync means the records are not durable; treat it as
-    /// fatal, not as something to retry blindly. The log does not remember the
-    /// failure: a later `sync` can return `Ok` although the operating system may
-    /// have dropped the pages the failed flush did not write. After a failed
-    /// sync, stop appending and reopen the log, so recovery decides what
-    /// survived.
+    /// durable. A failed sync means the records are not durable, and the failure
+    /// is permanent for this handle: the operating system may have dropped the
+    /// pages it could not write, so a retry could succeed without them. Every
+    /// later sync covering anything not yet durable returns [`WalError::Io`].
+    /// Stop appending and reopen the log, so recovery decides what survived.
     ///
     /// # Examples
     ///

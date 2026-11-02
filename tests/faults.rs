@@ -7,7 +7,9 @@
 //! write failure fail-stops the log so nothing past the gap is read as durable.
 
 use std::io;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::thread;
 
 use wal_db::{MemStore, Wal, WalError, WalStore};
 
@@ -18,6 +20,7 @@ struct FaultyStore {
     /// Fail the write whose 1-based count reaches this (`usize::MAX` = never).
     fail_write_on: AtomicUsize,
     fail_sync: AtomicBool,
+    fail_next_sync: AtomicBool,
 }
 
 impl FaultyStore {
@@ -27,7 +30,13 @@ impl FaultyStore {
             writes: AtomicUsize::new(0),
             fail_write_on: AtomicUsize::new(usize::MAX),
             fail_sync: AtomicBool::new(false),
+            fail_next_sync: AtomicBool::new(false),
         }
+    }
+
+    fn failing_next_sync(self) -> Self {
+        self.fail_next_sync.store(true, Ordering::SeqCst);
+        self
     }
 
     fn fail_write_number(self, n: usize) -> Self {
@@ -59,7 +68,9 @@ impl WalStore for FaultyStore {
     }
 
     fn sync(&self) -> wal_db::Result<()> {
-        if self.fail_sync.load(Ordering::SeqCst) {
+        if self.fail_sync.load(Ordering::SeqCst)
+            || self.fail_next_sync.swap(false, Ordering::SeqCst)
+        {
             return Err(io::Error::other("injected: fsync failed").into());
         }
         self.inner.sync()
@@ -130,6 +141,40 @@ fn fsync_failure_surfaces_as_an_error() {
         matches!(err, WalError::Io { .. }),
         "fsync failure should be an Io error, got {err:?}"
     );
+}
+
+#[test]
+fn a_failed_flush_is_not_undone_by_a_later_one_that_succeeds() {
+    let wal = Wal::with_store(FaultyStore::new().failing_next_sync()).unwrap();
+    let _ = wal.append(b"record").unwrap();
+    assert!(wal.sync().is_err());
+
+    // The store would succeed now, but what the failed flush held may be gone.
+    let err = wal.sync().unwrap_err();
+    assert!(matches!(err, WalError::Io { .. }), "got {err:?}");
+
+    let _ = wal.append(b"later").unwrap();
+    assert!(wal.sync().is_err());
+    assert!(wal.append_and_sync(b"later still").is_err());
+}
+
+#[test]
+fn every_concurrent_syncer_sees_a_failed_flush() {
+    const THREADS: usize = 8;
+
+    let wal = Arc::new(Wal::with_store(FaultyStore::new().failing_next_sync()).unwrap());
+    let handles: Vec<_> = (0..THREADS)
+        .map(|_| {
+            let wal = Arc::clone(&wal);
+            thread::spawn(move || wal.append_and_sync(b"record").is_ok())
+        })
+        .collect();
+
+    // The first flush fails and no flush after it can make up for it, so no
+    // thread may be told its record is durable.
+    for handle in handles {
+        assert!(!handle.join().unwrap());
+    }
 }
 
 #[test]
