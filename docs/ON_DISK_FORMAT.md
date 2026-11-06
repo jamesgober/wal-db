@@ -210,6 +210,11 @@ written and flushed *before* any segment is deleted, so a crash mid-truncation
 still recovers from the correct boundary. It is absent until the first prefix
 truncation; when absent, the head is 0.
 
+A writer replaces the marker atomically: it writes `head.tmp`, flushes it, renames
+it over `head`, and flushes the directory where the platform allows. A crash
+leaves the old marker or the new one, and possibly a stale `head.tmp`, which
+readers ignore.
+
 On open, a marker that is missing, short, or whose checksum does not match is
 ignored and the head falls back to 0, so recovery reads the whole log. This is
 always safe: it never skips a live record — at worst a prefix that was meant to be

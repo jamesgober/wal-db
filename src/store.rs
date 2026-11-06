@@ -13,7 +13,10 @@ use std::{
     fs::{File, OpenOptions},
     io,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use crate::error::{Result, WalError};
@@ -127,6 +130,10 @@ pub trait WalStore: Send + Sync {
 pub struct FileStore {
     file: File,
     path: PathBuf,
+    /// The directory holding the file, flushed once per open by the first
+    /// [`sync`](WalStore::sync): that is what makes a new file's name durable.
+    parent: PathBuf,
+    parent_dirty: AtomicBool,
 }
 
 impl FileStore {
@@ -149,7 +156,13 @@ impl FileStore {
             .truncate(false)
             .open(&path)
             .map_err(|e| WalError::io("opening the log file", e))?;
-        Ok(FileStore { file, path })
+        let parent = parent_dir(&path);
+        Ok(FileStore {
+            file,
+            path,
+            parent,
+            parent_dirty: AtomicBool::new(true),
+        })
     }
 
     /// The path this store was opened from.
@@ -175,6 +188,7 @@ impl WalStore for FileStore {
     }
 
     fn sync(&self) -> Result<()> {
+        flush_dir_if_dirty(&self.parent_dirty, &self.parent)?;
         durable_sync(&self.file).map_err(|e| WalError::io("flushing to stable storage", e))
     }
 
@@ -346,6 +360,65 @@ pub(crate) fn durable_sync(file: &File) -> io::Result<()> {
     file.sync_data()
 }
 
+/// Flush a directory, so the names created, renamed, or removed in it survive a
+/// power loss. Flushing a file does not do this on Unix.
+///
+/// A directory that cannot be opened for lack of permission, or a filesystem
+/// that does not support the flush, is skipped rather than failed: the log has
+/// no other way to do this, and refusing would stop logs that work today. A real
+/// I/O error is returned. Plain `fsync` on macOS, where `F_FULLFSYNC` is not
+/// dependable on a directory; callers flush the directory first, so the file
+/// flush that follows empties the drive's write cache behind it.
+#[cfg(unix)]
+pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
+    let file = match File::open(dir) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    match file.sync_all() {
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported
+            ) =>
+        {
+            Ok(())
+        }
+        other => other,
+    }
+}
+
+/// A no-op: a directory cannot be flushed through the standard library on
+/// Windows, and NTFS commits its metadata changes through its own journal.
+#[cfg(not(unix))]
+pub(crate) fn sync_dir(_dir: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+/// Flush `dir` if `dirty` is set, clearing it. It stays set if the flush fails.
+///
+/// A store's `sync` is only ever entered by one thread at a time. A file created
+/// while the flush runs sets the flag again for the next sync, and any record
+/// that sync must cover was written, flag included, before the sync began.
+pub(crate) fn flush_dir_if_dirty(dirty: &AtomicBool, dir: &Path) -> Result<()> {
+    if dirty.load(Ordering::Acquire) && dirty.swap(false, Ordering::AcqRel) {
+        if let Err(error) = sync_dir(dir) {
+            dirty.store(true, Ordering::Release);
+            return Err(WalError::io("flushing the log directory", error));
+        }
+    }
+    Ok(())
+}
+
+/// The directory holding `path`; `.` for a bare file name.
+pub(crate) fn parent_dir(path: &Path) -> PathBuf {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Positioned I/O. Reads and writes carry their own offset so they never move a
 // shared file cursor, which is what lets disjoint concurrent writes proceed
@@ -434,6 +507,52 @@ pub(crate) fn pread_fill(file: &File, mut offset: u64, buf: &mut [u8]) -> io::Re
         }
     }
     Ok(total)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod dir_tests {
+    use super::*;
+
+    #[test]
+    fn test_parent_dir_of_a_bare_name_is_the_current_directory() {
+        assert_eq!(parent_dir(Path::new("app.wal")), PathBuf::from("."));
+        assert_eq!(parent_dir(Path::new("a/app.wal")), PathBuf::from("a"));
+    }
+
+    #[test]
+    fn test_sync_dir_flushes_a_real_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        sync_dir(dir.path()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_flush_failure_keeps_the_directory_dirty() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        let dirty = AtomicBool::new(true);
+        assert!(flush_dir_if_dirty(&dirty, &missing).is_err());
+        assert!(dirty.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn test_clean_directory_is_not_flushed() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        let dirty = AtomicBool::new(false);
+        // A flush would fail on Unix: the path does not exist.
+        flush_dir_if_dirty(&dirty, &missing).unwrap();
+    }
+
+    #[test]
+    fn test_file_store_flushes_its_directory_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileStore::open(dir.path().join("log.wal")).unwrap();
+        assert!(store.parent_dirty.load(Ordering::Acquire));
+        store.sync().unwrap();
+        assert!(!store.parent_dirty.load(Ordering::Acquire));
+    }
 }
 
 #[cfg(test)]

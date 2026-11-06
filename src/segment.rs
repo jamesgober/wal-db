@@ -22,13 +22,15 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
 use crate::{
     error::{Result, WalError},
-    store::{WalStore, durable_sync, pread_fill, pwrite_all},
+    store::{
+        WalStore, durable_sync, flush_dir_if_dirty, parent_dir, pread_fill, pwrite_all, sync_dir,
+    },
 };
 
 /// The fixed width of a segment file name, in zero-padded decimal digits — wide
@@ -39,6 +41,9 @@ const NAME_EXT: &str = "wal";
 /// Name of the file that records the log's head (its lowest surviving offset)
 /// after a prefix has been dropped. Absent until the first `truncate_before`.
 const HEAD_FILE: &str = "head";
+/// The marker is written here, flushed, and renamed over [`HEAD_FILE`], so a
+/// crash leaves the old marker or the new one and never a torn one.
+const HEAD_TMP_FILE: &str = "head.tmp";
 /// Size of the head marker: an 8-byte offset plus a 4-byte CRC32C of it.
 const HEAD_FILE_LEN: usize = 12;
 
@@ -80,6 +85,12 @@ pub struct SegmentedStore {
     /// Lowest offset still present — the start of the lowest segment that has not
     /// been dropped by `truncate_before`. Recovery scans from here.
     head: AtomicU64,
+    /// A segment file was created or removed since the directory was last
+    /// flushed. Set at open too: a sync must also cover names left unflushed by
+    /// a process that stopped before flushing them.
+    dir_dirty: AtomicBool,
+    /// This store created the log directory, whose own name lives in its parent.
+    parent_dirty: AtomicBool,
 }
 
 impl SegmentedStore {
@@ -103,6 +114,7 @@ impl SegmentedStore {
             ));
         }
         let dir = dir.as_ref().to_path_buf();
+        let created = !dir.is_dir();
         fs::create_dir_all(&dir).map_err(|e| WalError::io("creating the log directory", e))?;
 
         // Find the highest existing segment to compute the current logical length.
@@ -138,6 +150,8 @@ impl SegmentedStore {
             // Everything already on disk is treated as durable on open.
             synced_from: AtomicU64::new(active),
             head: AtomicU64::new(head),
+            dir_dirty: AtomicBool::new(true),
+            parent_dirty: AtomicBool::new(created),
         })
     }
 
@@ -181,6 +195,10 @@ impl SegmentedStore {
             .truncate(false)
             .open(&path)
             .map_err(|e| WalError::io("creating a log segment", e))?;
+        // Set before the write that follows completes, so the sync covering it
+        // flushes the new name. The append path pays one atomic store per
+        // segment; the directory flush itself happens in `sync`.
+        self.dir_dirty.store(true, Ordering::Release);
         let file = Arc::new(file);
         let _ = map.insert(index, Arc::clone(&file));
         Ok(file)
@@ -224,16 +242,21 @@ impl SegmentedStore {
         let crc = crc32c::crc32c(&buf[..8]);
         buf[8..].copy_from_slice(&crc.to_le_bytes());
 
-        let path = self.dir.join(HEAD_FILE);
+        let tmp = self.dir.join(HEAD_TMP_FILE);
         let file = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
-            .open(&path)
+            .open(&tmp)
             .map_err(|e| WalError::io("writing the head marker", e))?;
         pwrite_all(&file, 0, &buf).map_err(|e| WalError::io("writing the head marker", e))?;
         durable_sync(&file).map_err(|e| WalError::io("flushing the head marker", e))?;
-        Ok(())
+        // Windows refuses to rename a file that still has an open handle.
+        drop(file);
+
+        fs::rename(&tmp, self.dir.join(HEAD_FILE))
+            .map_err(|e| WalError::io("replacing the head marker", e))?;
+        sync_dir(&self.dir).map_err(|e| WalError::io("flushing the log directory", e))
     }
 }
 
@@ -321,10 +344,13 @@ impl WalStore for SegmentedStore {
             };
             match index.cmp(&last_index) {
                 std::cmp::Ordering::Greater => {
-                    // Entirely past the new end: drop the segment.
+                    // Entirely past the new end: drop the segment. The next
+                    // sync flushes the removal; a segment that came back after
+                    // a power loss would bring truncated records with it.
                     fs::remove_file(entry.path())
                         .map_err(|e| WalError::io("removing a truncated segment", e))?;
                     let _ = self.write_map().remove(&index);
+                    self.dir_dirty.store(true, Ordering::Release);
                 }
                 std::cmp::Ordering::Equal => {
                     // Straddles the new end: shrink it to the kept bytes.
@@ -342,6 +368,11 @@ impl WalStore for SegmentedStore {
     }
 
     fn sync(&self) -> Result<()> {
+        // Directory first: on macOS only the file flush below empties the
+        // drive's write cache.
+        flush_dir_if_dirty(&self.dir_dirty, &self.dir)?;
+        flush_dir_if_dirty(&self.parent_dirty, &parent_dir(&self.dir))?;
+
         let written = self.max_written.load(Ordering::Acquire);
         if written == 0 {
             return Ok(());
@@ -430,6 +461,83 @@ fn parse_segment_name(name: &OsStr) -> Option<u64> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    fn dir_dirty(store: &SegmentedStore) -> bool {
+        store.dir_dirty.load(Ordering::Acquire)
+    }
+
+    #[test]
+    fn test_new_segment_marks_the_directory_until_the_next_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SegmentedStore::open(dir.path(), 16).unwrap();
+        assert!(dir_dirty(&store), "a fresh open has names to flush");
+
+        store.write_at(0, &[1; 8]).unwrap();
+        store.sync().unwrap();
+        assert!(!dir_dirty(&store));
+
+        // Same segment: no new name, so no directory flush.
+        store.write_at(8, &[1; 4]).unwrap();
+        assert!(!dir_dirty(&store));
+
+        // Crossing into a new segment creates a name.
+        store.write_at(12, &[1; 8]).unwrap();
+        assert!(dir_dirty(&store));
+        store.sync().unwrap();
+        assert!(!dir_dirty(&store));
+    }
+
+    #[test]
+    fn test_removing_a_segment_marks_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SegmentedStore::open(dir.path(), 16).unwrap();
+        store.write_at(0, &[1; 40]).unwrap();
+        store.sync().unwrap();
+
+        store.truncate(8).unwrap();
+        assert!(dir_dirty(&store));
+        store.sync().unwrap();
+        assert!(!dir_dirty(&store));
+    }
+
+    #[test]
+    fn test_only_a_created_directory_marks_its_parent() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("log");
+
+        let store = SegmentedStore::open(&path, 16).unwrap();
+        assert!(store.parent_dirty.load(Ordering::Acquire));
+        store.sync().unwrap();
+        assert!(!store.parent_dirty.load(Ordering::Acquire));
+        drop(store);
+
+        let store = SegmentedStore::open(&path, 16).unwrap();
+        assert!(!store.parent_dirty.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn test_head_marker_replacement_leaves_no_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SegmentedStore::open(dir.path(), 16).unwrap();
+        store.write_head_file(1).unwrap();
+        store.write_head_file(2).unwrap();
+        assert_eq!(read_head_file(dir.path()).unwrap(), Some(2));
+        assert!(!dir.path().join(HEAD_TMP_FILE).exists());
+    }
+
+    #[test]
+    fn test_torn_temporary_marker_never_touches_the_live_one() {
+        // A crash while writing the replacement: the live marker is what counts.
+        let dir = tempfile::tempdir().unwrap();
+        let store = SegmentedStore::open(dir.path(), 16).unwrap();
+        store.write_head_file(7).unwrap();
+        fs::write(dir.path().join(HEAD_TMP_FILE), [0xAB; 3]).unwrap();
+        assert_eq!(read_head_file(dir.path()).unwrap(), Some(7));
+
+        // The next replacement overwrites the leftover.
+        store.write_head_file(9).unwrap();
+        assert_eq!(read_head_file(dir.path()).unwrap(), Some(9));
+    }
 
     #[test]
     fn test_segment_name_roundtrips() {
