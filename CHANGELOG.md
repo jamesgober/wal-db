@@ -18,7 +18,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
-## [1.1.1] - 2026-11-02
+## [1.1.1] - 2026-11-05
 
 Durability fixes. No API or on-disk format change.
 
