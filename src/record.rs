@@ -75,7 +75,7 @@ pub(crate) fn encode(buf: &mut Vec<u8>, payload: &[u8]) {
 
     // Checksum covers the length and the payload — everything past the 4-byte
     // checksum field itself.
-    let crc = crc32c::crc32c(&buf[LEN_OFFSET..]);
+    let crc = crate::crc::crc32c(&buf[LEN_OFFSET..]);
     buf[CRC_OFFSET..LEN_OFFSET].copy_from_slice(&crc.to_le_bytes());
 }
 
@@ -96,8 +96,8 @@ pub(crate) fn parse_header(bytes: &[u8; HEADER_LEN]) -> Header {
 /// equals the checksum of those bytes concatenated.
 #[inline]
 pub(crate) fn verify(header_bytes: &[u8; HEADER_LEN], payload: &[u8], expected_crc: u32) -> bool {
-    let partial = crc32c::crc32c(&header_bytes[LEN_OFFSET..HEADER_LEN]);
-    let crc = crc32c::crc32c_append(partial, payload);
+    let partial = crate::crc::crc32c(&header_bytes[LEN_OFFSET..HEADER_LEN]);
+    let crc = crate::crc::crc32c_append(partial, payload);
     crc == expected_crc
 }
 
@@ -143,7 +143,7 @@ mod tests {
         let mut buf = Vec::new();
         encode(&mut buf, b"some bytes here");
         let header = parse_header(&header_array(&buf));
-        let contiguous = crc32c::crc32c(&buf[LEN_OFFSET..]);
+        let contiguous = crate::crc::crc32c(&buf[LEN_OFFSET..]);
         assert_eq!(contiguous, header.crc);
     }
 

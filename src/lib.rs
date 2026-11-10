@@ -73,7 +73,7 @@
 //! |----------|-----------------|
 //! | Linux    | `fdatasync` (via [`std::fs::File::sync_data`]) |
 //! | Windows  | `FlushFileBuffers` (via [`std::fs::File::sync_data`]) |
-//! | macOS    | `fcntl(F_FULLFSYNC)` — **not** plain `fsync`, which leaves data in the drive's write cache |
+//! | macOS    | `fcntl(F_FULLFSYNC)` (via [`std::fs::File::sync_data`], which issues it on Apple platforms) — **not** plain `fsync`, which leaves data in the drive's write cache |
 //!
 //! ## Recovery
 //!
@@ -123,6 +123,7 @@
 
 mod commit;
 mod config;
+mod crc;
 mod error;
 mod lsn;
 mod record;

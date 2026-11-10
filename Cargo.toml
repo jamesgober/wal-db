@@ -9,7 +9,7 @@
 #╚═══════════════════════════════╝
 [package]
 name    = "wal-db"
-version = "1.1.1"
+version = "1.2.0"
 
 rust-version = "1.85"
 edition = "2024"
@@ -63,25 +63,15 @@ pack-io = ["dep:pack-io"]
 # Domain error type. Portfolio crates standardise on `error-forge` for
 # stable error metadata (kind/retryable/status) instead of thiserror/anyhow.
 # Default features are off — only the `ForgeError` trait is needed.
-error-forge = { version = "1.0", default-features = false }
-# Hardware-accelerated CRC32C (Castagnoli) for torn-write detection. Uses
-# the SSE4.2 `crc32` instruction on x86_64 and the CRC extension on aarch64
-# with a software fallback. Zero dependencies of its own; rolling this by
-# hand would mean re-implementing the same intrinsics with no upside.
-crc32c = "0.6"
+error-forge = { version = "1.1", default-features = false }
 # Optional typed-record framing, behind the `pack-io` feature. The `derive`
 # feature provides the `Serialize`/`Deserialize` derives consumers use.
 pack-io = { version = "1.0", features = ["derive"], optional = true }
 
-# macOS is the one platform where the standard library's fsync is not a
-# durability barrier: `File::sync_all` issues `fsync`, which flushes the
-# page cache to the device but not the device's own write cache. Only
-# `fcntl(F_FULLFSYNC)` does. `libc` is pulled in solely to call it, and
-# solely on macOS.
-[target.'cfg(target_os = "macos")'.dependencies]
-libc = "0.2"
-
 [dev-dependencies]
+# The reference the 1.0 format was written with: the tests check the
+# in-crate CRC32C (`src/crc.rs`) against it on every length and alignment.
+crc32c    = "0.6"
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest  = "1"
 tempfile  = "3"

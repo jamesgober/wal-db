@@ -239,7 +239,7 @@ impl SegmentedStore {
     fn write_head_file(&self, head: u64) -> Result<()> {
         let mut buf = [0u8; HEAD_FILE_LEN];
         buf[..8].copy_from_slice(&head.to_le_bytes());
-        let crc = crc32c::crc32c(&buf[..8]);
+        let crc = crate::crc::crc32c(&buf[..8]);
         buf[8..].copy_from_slice(&crc.to_le_bytes());
 
         let tmp = self.dir.join(HEAD_TMP_FILE);
@@ -273,7 +273,7 @@ fn read_head_file(dir: &Path) -> Result<Option<u64>> {
                 bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
             ]);
             let stored = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
-            if crc32c::crc32c(&bytes[..8]) == stored {
+            if crate::crc::crc32c(&bytes[..8]) == stored {
                 Ok(Some(head))
             } else {
                 Ok(None) // torn or corrupt marker: fall back to full recovery

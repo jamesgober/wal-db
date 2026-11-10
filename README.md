@@ -80,7 +80,7 @@ That flush is not the same call on every platform, and getting it wrong is silen
 
 ```toml
 [dependencies]
-wal-db = "1.1"
+wal-db = "1.2"
 ```
 
 <br>
@@ -258,7 +258,7 @@ By default a record is bytes. With the `pack-io` feature, a record can be any ty
 
 ```toml
 [dependencies]
-wal-db = { version = "1.1", features = ["pack-io"] }
+wal-db = { version = "1.2", features = ["pack-io"] }
 ```
 
 ```rust

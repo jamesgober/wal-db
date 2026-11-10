@@ -18,6 +18,41 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [1.2.0] - 2026-11-10
+
+No third-party crate in a default build, on any platform. The on-disk format
+and every checksum are unchanged.
+
+### Changed
+
+- CRC32C is computed in the crate (`src/crc.rs`) instead of by the `crc32c`
+  crate, which is gone from `[dependencies]`. The CPU is asked at run time:
+  the SSE4.2 `crc32` instruction on x86_64 or the ARMv8 CRC extension on
+  aarch64, three streams at a time, and slicing-by-8 tables on other CPUs (the
+  design of `page-db`'s and `lsm-db`'s). The values are byte-identical: the
+  tests check every path, whole buffers and appends at every split, against
+  the published vectors and against the `crc32c` crate (now a dev-dependency
+  only) on every length and alignment.
+- macOS: the durability call is `File::sync_data`, as on every other platform,
+  and `libc` is gone. The standard library issues `fcntl(F_FULLFSYNC)` for
+  `sync_data` and `sync_all` on Apple platforms (`os_datasync` in
+  `library/std/src/sys/pal/unix/fs.rs`, checked in the 1.85 MSRV's source), so
+  1.0 and 1.1's own `F_FULLFSYNC` call made the same call; the barrier is the
+  same.
+- `error-forge` 1.1, which brings in no third-party crate. A default build's
+  `cargo tree -e normal` is `wal-db`, `error-forge`, and `error-forge-derive`.
+- `unsafe` code: the CRC instructions in `src/crc.rs` (module `hw`, each block
+  commented), called only after the CPU said it has them. The `libc` call was
+  the only other `unsafe` block.
+
+Measured on the release machine (Windows, x86_64), alternating 1.1 and 1.2 in
+one job, three rounds: `append/single/memstore` 96, 113, 97 ns against 97,
+131, 96 ns, and `recovery/replay/10k` 91, 93, 110 ms against 101, 95, 97 ms,
+equal within noise; the rest of the suite (fsync-bound on this machine)
+unchanged within noise.
+
+---
+
 ## [1.1.1] - 2026-11-05
 
 Durability fixes. No API or on-disk format change.
@@ -536,7 +571,8 @@ Initial scaffold and repository bootstrap. No WAL logic yet — this release est
 - `.gitattributes` normalising line endings and excluding development paths from archives.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) — gitignored.
 
-[Unreleased]: https://github.com/jamesgober/wal-db/compare/v1.1.1...HEAD
+[Unreleased]: https://github.com/jamesgober/wal-db/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/jamesgober/wal-db/compare/v1.1.1...v1.2.0
 [1.1.1]: https://github.com/jamesgober/wal-db/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/jamesgober/wal-db/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/jamesgober/wal-db/compare/v0.9.1...v1.0.0
