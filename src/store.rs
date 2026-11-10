@@ -124,8 +124,8 @@ pub trait WalStore: Send + Sync {
 /// never contend on a shared file cursor, and a recovery read never disturbs an
 /// append. [`sync`](WalStore::sync) issues the platform's true durability
 /// barrier: `fdatasync` on Linux, `FlushFileBuffers` on Windows, and
-/// `fcntl(F_FULLFSYNC)` on macOS — the last because macOS's `fsync` does not
-/// flush the drive's write cache.
+/// `fcntl(F_FULLFSYNC)` on macOS (macOS's `fsync` does not flush the drive's
+/// write cache), all through [`File::sync_data`].
 #[derive(Debug)]
 pub struct FileStore {
     file: File,
@@ -331,31 +331,13 @@ impl WalStore for MemStore {
 
 /// Flush every buffered write for `file` to stable storage.
 ///
-/// On macOS this is `fcntl(F_FULLFSYNC)`. The standard library's `sync_all` and
-/// `sync_data` call `fsync(2)` there, which flushes the page cache to the device
-/// but leaves the data in the device's own write cache, where a power loss can
-/// still take it. `F_FULLFSYNC` is the documented way to force a full flush.
-#[cfg(target_os = "macos")]
-pub(crate) fn durable_sync(file: &File) -> io::Result<()> {
-    use std::os::unix::io::AsRawFd;
-
-    let fd = file.as_raw_fd();
-    // SAFETY: `fd` is a valid, open file descriptor for as long as `file` is
-    // borrowed, so it cannot be closed from under us. `F_FULLFSYNC` takes no
-    // argument pointer and neither reads nor writes any user buffer. `fcntl`
-    // reports failure by returning -1 and setting `errno`, which is checked
-    // immediately below.
-    let ret = unsafe { libc::fcntl(fd, libc::F_FULLFSYNC) };
-    if ret == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-/// On Linux `sync_data` is `fdatasync`; on Windows it is `FlushFileBuffers`.
-/// Both are true durability barriers, so the standard library call is correct
-/// on every platform except macOS.
-#[cfg(not(target_os = "macos"))]
+/// [`File::sync_data`] is the platform's true durability barrier: `fdatasync`
+/// on Linux, `FlushFileBuffers` on Windows, and `fcntl(F_FULLFSYNC)` on macOS
+/// and the other Apple platforms, where plain `fsync` leaves data in the
+/// drive's own write cache. The standard library has issued `F_FULLFSYNC`
+/// there for both `sync_all` and `sync_data` since before this crate's MSRV
+/// (`library/std/src/sys/pal/unix/fs.rs`, `os_datasync`, in 1.85), so the
+/// direct `libc` call wal-db 1.0 and 1.1 made duplicated it.
 pub(crate) fn durable_sync(file: &File) -> io::Result<()> {
     file.sync_data()
 }

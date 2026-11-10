@@ -132,7 +132,7 @@ fn oversized<S: WalStore>(
         return Ok(None);
     }
 
-    let mut crc = crc32c::crc32c(&header[LEN_OFFSET..]);
+    let mut crc = crate::crc::crc32c(&header[LEN_OFFSET..]);
     let mut chunk = vec![0u8; MARK_INTERVAL as usize];
     let record_end = payload_start + u64::from(parsed.len);
     let mut from = payload_start;
@@ -142,7 +142,7 @@ fn oversized<S: WalStore>(
         if store.read_at(from, buf)? < len {
             return Ok(Some(Tail::Unreadable));
         }
-        crc = crc32c::crc32c_append(crc, buf);
+        crc = crate::crc::crc32c_append(crc, buf);
         from += len as u64;
     }
     Ok((crc == parsed.crc).then_some(Tail::Oversized))
@@ -266,7 +266,7 @@ impl Prefix {
         if store.read_at(from, &mut self.scratch)? < len {
             return Ok(None);
         }
-        Ok(Some(crc32c::crc32c_append(crc, &self.scratch)))
+        Ok(Some(crate::crc::crc32c_append(crc, &self.scratch)))
     }
 }
 
@@ -384,8 +384,9 @@ mod tests {
             let b = noise(b_len, 2 + b_len as u64);
             let mut ab = a.clone();
             ab.extend_from_slice(&b);
-            let expected = crc32c::crc32c(&ab);
-            let derived = zero_shift(crc32c::crc32c(&a), b.len() as u64) ^ crc32c::crc32c(&b);
+            let expected = crate::crc::crc32c(&ab);
+            let derived =
+                zero_shift(crate::crc::crc32c(&a), b.len() as u64) ^ crate::crc::crc32c(&b);
             assert_eq!(derived, expected, "a={a_len} b={b_len}");
         }
     }
@@ -411,7 +412,7 @@ mod tests {
             (100, 20_000),
         ] {
             let got = prefix.span(&store, from, to).unwrap().unwrap();
-            let want = crc32c::crc32c(&bytes[from as usize..to as usize]);
+            let want = crate::crc::crc32c(&bytes[from as usize..to as usize]);
             assert_eq!(got, want, "[{from}, {to})");
         }
     }

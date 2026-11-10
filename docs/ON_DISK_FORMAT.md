@@ -95,7 +95,7 @@ with these parameters:
 | Final XOR | `0xFFFFFFFF` |
 | Check value (`"123456789"`) | `0xE3069283` |
 
-This matches the CRC-32C used by iSCSI, SCTP, ext4, and the Rust `crc32c` crate.
+This matches the CRC-32C used by iSCSI, SCTP, ext4, and the Rust `crc32c` crate (which computed it until 1.1; since 1.2 the crate computes it itself, with identical values).
 On x86-64 and aarch64 it compiles to the hardware CRC instruction.
 
 The checksum covers the `length` field and the `payload`, in that order — every
