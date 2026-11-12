@@ -149,6 +149,27 @@ pub use crate::wal::{Record, Wal, WalIter};
 #[cfg(feature = "pack-io")]
 pub use pack_io;
 
+/// The `pack-io` 2 codec, re-exported for [`Wal::append_pack`] and
+/// [`Record::unpack`].
+///
+/// Available only with the `pack-io-2` feature. Derived types name this path,
+/// since the derives default to a crate called `pack_io`:
+///
+/// ```
+/// # #[cfg(feature = "pack-io-2")]
+/// # {
+/// use wal_db::pack_io2::{Deserialize, Serialize};
+///
+/// #[derive(Serialize, Deserialize, PartialEq, Debug)]
+/// #[pack_io(crate = "wal_db::pack_io2")]
+/// struct Event {
+///     id: u64,
+/// }
+/// # }
+/// ```
+#[cfg(feature = "pack-io-2")]
+pub use pack_io2;
+
 /// The common imports for working with a log.
 ///
 /// Glob-importing the prelude pulls in the four-call API and the types its

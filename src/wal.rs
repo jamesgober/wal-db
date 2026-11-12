@@ -468,6 +468,46 @@ impl<S: WalStore> Wal<S> {
         self.append(&bytes)
     }
 
+    /// Serialise `value` with `pack-io` 2 and append it, returning its
+    /// [`Lsn`]. [`Record::unpack`] reads it back. Available with the
+    /// `pack-io-2` feature. Like `append`, it does not sync.
+    ///
+    /// For the values both codecs support, the bytes are the same as
+    /// [`append_typed`](Wal::append_typed) writes.
+    ///
+    /// # Errors
+    ///
+    /// - [`WalError::Encoding`] if the value fails to serialise.
+    /// - Otherwise the errors of [`append`](Wal::append).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use wal_db::{MemStore, Wal};
+    /// use wal_db::pack_io2::{Deserialize, Serialize};
+    ///
+    /// #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    /// #[pack_io(crate = "wal_db::pack_io2")]
+    /// struct Entry {
+    ///     key: String,
+    ///     value: u64,
+    /// }
+    ///
+    /// # fn main() -> Result<(), wal_db::WalError> {
+    /// let wal = Wal::with_store(MemStore::new())?;
+    /// wal.append_pack(&Entry { key: "balance".into(), value: 100 })?;
+    ///
+    /// let entry: Entry = wal.iter()?.next().unwrap()?.unpack()?;
+    /// assert_eq!(entry.value, 100);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(feature = "pack-io-2")]
+    pub fn append_pack<T: pack_io2::Serialize + ?Sized>(&self, value: &T) -> Result<Lsn> {
+        let bytes = pack_io2::encode(value).map_err(WalError::encoding)?;
+        self.append(&bytes)
+    }
+
     /// Iterate the log from the beginning, yielding each record in append order.
     ///
     /// The iterator walks the records that are fully written at the moment it is
@@ -865,6 +905,15 @@ impl Record {
     ///
     /// The mirror of [`Wal::append_typed`]. Available with the `pack-io` feature.
     ///
+    /// # Untrusted bytes
+    ///
+    /// `pack-io` 1.0's decoder is not bounded on hostile input: a few crafted
+    /// bytes can make it allocate hundreds of MiB. A record's CRC32C catches
+    /// damage, not a log written by someone else. Decode only logs this
+    /// program wrote; for any other, use [`unpack`](Record::unpack) (feature
+    /// `pack-io-2`), which reads the same records with bounded allocation and
+    /// nesting.
+    ///
     /// # Errors
     ///
     /// Returns [`WalError::Encoding`] if the bytes do not deserialise into `T` —
@@ -895,6 +944,62 @@ impl Record {
     #[cfg(feature = "pack-io")]
     pub fn decode<T: pack_io::Deserialize>(&self) -> Result<T> {
         pack_io::decode(&self.data).map_err(WalError::encoding)
+    }
+
+    /// Decode the record's payload with `pack-io` 2, under its default
+    /// limits: no allocation the input cannot back, at most 1 GiB for one
+    /// value, and at most 128 levels of nested types.
+    ///
+    /// The mirror of [`Wal::append_pack`]. It also reads records written by
+    /// [`Wal::append_typed`]: the same values decode from the same bytes. A
+    /// record nested deeper than 128 levels is refused; read it with
+    /// [`unpack_with`](Record::unpack_with) and a higher
+    /// [`max_depth`](pack_io2::Config::max_depth). Available with the
+    /// `pack-io-2` feature.
+    ///
+    /// # Errors
+    ///
+    /// [`WalError::Encoding`] if the bytes do not decode into `T` within the
+    /// limits.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use wal_db::{MemStore, Wal};
+    /// use wal_db::pack_io2::{Deserialize, Serialize};
+    ///
+    /// #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    /// #[pack_io(crate = "wal_db::pack_io2")]
+    /// struct Event {
+    ///     id: u64,
+    ///     name: String,
+    /// }
+    ///
+    /// # fn main() -> Result<(), wal_db::WalError> {
+    /// let wal = Wal::with_store(MemStore::new())?;
+    /// wal.append_pack(&Event { id: 7, name: "boot".into() })?;
+    /// let event: Event = wal.iter()?.next().unwrap()?.unpack()?;
+    /// assert_eq!(event, Event { id: 7, name: "boot".into() });
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(feature = "pack-io-2")]
+    pub fn unpack<T: pack_io2::Deserialize>(&self) -> Result<T> {
+        pack_io2::decode(&self.data).map_err(WalError::encoding)
+    }
+
+    /// [`unpack`](Record::unpack) under the limits of `config`: raise
+    /// [`max_depth`](pack_io2::Config::max_depth) to read an old record
+    /// nested more than 128 levels deep, or lower the limits for bytes from
+    /// a less trusted source. Available with the `pack-io-2` feature.
+    ///
+    /// # Errors
+    ///
+    /// [`WalError::Encoding`] if `config` is invalid or the bytes do not
+    /// decode into `T` within its limits.
+    #[cfg(feature = "pack-io-2")]
+    pub fn unpack_with<T: pack_io2::Deserialize>(&self, config: pack_io2::Config) -> Result<T> {
+        pack_io2::decode_with_config(&self.data, config).map_err(WalError::encoding)
     }
 }
 

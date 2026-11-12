@@ -18,6 +18,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [1.3.0] - 2026-11-11
+
+Typed records through `pack-io` 2, whose decoder is bounded on hostile
+input. The log format, the byte-record API, and the `pack-io` feature are
+unchanged.
+
+### Added
+
+- Feature `pack-io-2`: `Wal::append_pack`, `Record::unpack`, and `Record::unpack_with(pack_io2::Config)`, through `pack-io` 2, re-exported as `wal_db::pack_io2`. They read records written with `append_typed`; the tests check that `pack-io` 2 decodes such records to the same values and encodes those values to the same bytes. `unpack` keeps `pack-io` 2's default limits, including at most 128 levels of nested types. `unpack_with` raises them, for example for an old record nested deeper than that. Derived types name the crate: `#[pack_io(crate = "wal_db::pack_io2")]`. Both features can be on at once.
+
+### Security
+
+- `Record::decode` (feature `pack-io`) now documents that `pack-io` 1.0's decoder is not bounded on hostile input: a few crafted bytes can make it allocate hundreds of MiB, and a record's CRC32C catches damage, not a log written by someone else. Use `Record::unpack` for logs from any other source. In 2.0, `pack-io` 2 replaces 1.0 under the original names.
+
+---
+
 ## [1.2.0] - 2026-11-10
 
 No third-party crate in a default build, on any platform. The on-disk format
@@ -571,7 +587,8 @@ Initial scaffold and repository bootstrap. No WAL logic yet — this release est
 - `.gitattributes` normalising line endings and excluding development paths from archives.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) — gitignored.
 
-[Unreleased]: https://github.com/jamesgober/wal-db/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/jamesgober/wal-db/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/jamesgober/wal-db/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/jamesgober/wal-db/compare/v1.1.1...v1.2.0
 [1.1.1]: https://github.com/jamesgober/wal-db/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/jamesgober/wal-db/compare/v1.0.0...v1.1.0

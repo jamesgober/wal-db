@@ -92,10 +92,10 @@ iterator-based and stops at the first torn or corrupt record.
 
 ```toml
 [dependencies]
-wal-db = "1.2"
+wal-db = "1.3"
 
 # Typed records via pack-io:
-wal-db = { version = "1.2", features = ["pack-io"] }
+wal-db = { version = "1.3", features = ["pack-io"] }
 ```
 
 The default feature set is empty; the crate is standard-library only.
@@ -361,6 +361,37 @@ let wal = Wal::with_store(MemStore::new())?;
 wal.append_typed(&Entry { key: "balance".into(), value: 100 })?;
 
 let entry: Entry = wal.iter()?.next().unwrap()?.decode()?;
+assert_eq!(entry.value, 100);
+# Ok(())
+# }
+```
+
+### `Wal::append_pack`
+
+```rust
+// Requires the `pack-io-2` feature (since 1.3).
+pub fn append_pack<T: pack_io2::Serialize + ?Sized>(&self, value: &T) -> Result<Lsn>
+```
+
+`append_typed` through `pack-io` 2, whose decoder is bounded on hostile input.
+[`Record::unpack`](#record) reads it back. For the values both codecs support,
+the bytes are the same as `append_typed` writes, so a log written with one
+reads with the other. The codec is re-exported as `wal_db::pack_io2`; its
+derives default to a crate named `pack_io`, so a derived type names the path:
+
+```rust
+use wal_db::{MemStore, Wal};
+use wal_db::pack_io2::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
+#[pack_io(crate = "wal_db::pack_io2")]
+struct Entry { key: String, value: u64 }
+
+# fn main() -> Result<(), wal_db::WalError> {
+let wal = Wal::with_store(MemStore::new())?;
+wal.append_pack(&Entry { key: "balance".into(), value: 100 })?;
+
+let entry: Entry = wal.iter()?.next().unwrap()?.unpack()?;
 assert_eq!(entry.value, 100);
 # Ok(())
 # }
@@ -670,6 +701,8 @@ impl Record {
     pub fn is_empty(&self) -> bool;
     pub fn into_data(self) -> Vec<u8>;
     pub fn decode<T: pack_io::Deserialize>(&self) -> Result<T>; // pack-io feature
+    pub fn unpack<T: pack_io2::Deserialize>(&self) -> Result<T>; // pack-io-2 feature
+    pub fn unpack_with<T: pack_io2::Deserialize>(&self, config: pack_io2::Config) -> Result<T>; // pack-io-2 feature
 }
 ```
 
@@ -679,6 +712,15 @@ its payload bytes. Yielded by [`Wal::iter`](#waliter). Borrow the payload with
 `pack-io` feature, `decode` deserialises the payload into a typed value — the
 mirror of [`Wal::append_typed`](#walappend_typed) — returning
 [`WalError::Encoding`](#walerror) if the bytes do not match the requested type.
+
+`decode` uses `pack-io` 1.0, whose decoder is not bounded on hostile input: a
+few crafted bytes can make it allocate hundreds of MiB, and a record's CRC32C
+catches damage, not a log written by someone else. Decode only logs your
+program wrote. With the `pack-io-2` feature (since 1.3), `unpack` reads the
+same records through `pack-io` 2: no allocation the input cannot back, at most
+1 GiB for one value, and at most 128 levels of nested types by default.
+`unpack_with(config)` takes other limits, for example a higher `max_depth` for
+an old record nested deeper than 128 levels.
 
 ```rust
 use wal_db::{MemStore, Wal};
@@ -1252,11 +1294,12 @@ both and stops.
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `pack-io` | no | Typed records via [`pack-io`](https://crates.io/crates/pack-io): adds [`Wal::append_typed`](#walappend_typed) and [`Record::decode`](#record), and re-exports `wal_db::pack_io` for the derives. |
+| `pack-io` | no | Typed records via [`pack-io`](https://crates.io/crates/pack-io) 1.0: adds [`Wal::append_typed`](#walappend_typed) and [`Record::decode`](#record), and re-exports `wal_db::pack_io` for the derives. Its decoder is not bounded on hostile input; see [`Record`](#record). |
+| `pack-io-2` | no | Since 1.3. Typed records via `pack-io` 2, whose decoder is bounded: adds [`Wal::append_pack`](#walappend_pack), [`Record::unpack`](#record), and `Record::unpack_with`, and re-exports `wal_db::pack_io2`. Reads records written through `pack-io`. In 2.0 it replaces `pack-io` under the original names. |
 
 The default surface is empty and standard-library only. Feature flags are
-additive: enabling `pack-io` only adds API, it never changes the byte-record
-behaviour.
+additive: enabling `pack-io` or `pack-io-2` only adds API, it never changes
+the byte-record behaviour. Both can be on at once.
 
 <hr>
 <br>

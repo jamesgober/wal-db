@@ -9,7 +9,7 @@
 #╚═══════════════════════════════╝
 [package]
 name    = "wal-db"
-version = "1.2.0"
+version = "1.3.0"
 
 rust-version = "1.85"
 edition = "2024"
@@ -58,6 +58,12 @@ default = []
 # which serialise any `pack_io::Serialize`/`Deserialize` value. Additive — the
 # byte-record API is unchanged when this is off.
 pack-io = ["dep:pack-io"]
+# Typed records via `pack-io` 2, whose decoder is bounded on hostile input
+# (allocation and nesting limits): adds `Wal::append_pack`, `Record::unpack`,
+# and `Record::unpack_with`, and re-exports the crate as `wal_db::pack_io2`.
+# Reads records written through the `pack-io` feature (same bytes for the
+# same values). Becomes the only typed-record codec in 2.0.
+pack-io-2 = ["dep:pack-io2"]
 
 [dependencies]
 # Domain error type. Portfolio crates standardise on `error-forge` for
@@ -67,6 +73,9 @@ error-forge = { version = "1.1", default-features = false }
 # Optional typed-record framing, behind the `pack-io` feature. The `derive`
 # feature provides the `Serialize`/`Deserialize` derives consumers use.
 pack-io = { version = "1.0", features = ["derive"], optional = true }
+# The same codec's 2.x series, behind `pack-io-2`, under its own name so both
+# can be on at once.
+pack-io2 = { package = "pack-io", version = "2.0", features = ["derive"], optional = true }
 
 [dev-dependencies]
 # The reference the 1.0 format was written with: the tests check the
