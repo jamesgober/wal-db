@@ -92,8 +92,7 @@ fn bench_commit_single(c: &mut Criterion) {
 /// alone, and an append made durable.
 fn bench_segmented(c: &mut Criterion) {
     let dir = tempfile::tempdir().expect("temp dir");
-    let wal = Wal::open_segmented(dir.path().join("segments"), 16 * 1024 * 1024)
-        .expect("open log");
+    let wal = Wal::open_segmented(dir.path().join("segments"), 16 * 1024 * 1024).expect("open log");
     c.bench_function("append/single/segmented", |b| {
         b.iter(|| wal.append(black_box(PAYLOAD)).expect("append"));
     });

@@ -40,7 +40,10 @@ fn main() -> Result<(), wal_db::WalError> {
     println!("replaying transfers:");
     for entry in wal.iter()? {
         let transfer: Transfer = entry?.unpack()?;
-        println!("  {} -> {}: {}", transfer.from, transfer.to, transfer.amount);
+        println!(
+            "  {} -> {}: {}",
+            transfer.from, transfer.to, transfer.amount
+        );
     }
     Ok(())
 }
