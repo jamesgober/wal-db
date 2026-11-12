@@ -649,7 +649,6 @@ Initial scaffold and repository bootstrap. No WAL logic yet — this release est
 - `.github/workflows/ci.yml` — Linux/macOS/Windows CI matrix on stable and MSRV.
 - `deny.toml` — cargo-deny license / advisory / source policy.
 - `.gitattributes` normalising line endings and excluding development paths from archives.
-- `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) — gitignored.
 
 [Unreleased]: https://github.com/jamesgober/wal-db/compare/v1.4.0...HEAD
 [1.4.0]: https://github.com/jamesgober/wal-db/compare/v1.3.0...v1.4.0
