@@ -68,9 +68,10 @@ pub enum WalError {
 
     /// A typed record could not be encoded or decoded.
     ///
-    /// Produced only by the typed-record API (the `pack-io` feature):
-    /// `Wal::append_typed` when a value fails to serialise, or `Record::decode`
-    /// when a record's bytes do not deserialise into the requested type.
+    /// Produced only by the typed-record API (the `pack-io` and `pack-io-2`
+    /// features): `Wal::append_typed` or `Wal::append_pack` when a value fails
+    /// to serialise, or `Record::decode`, `unpack`, or `unpack_with` when a
+    /// record's bytes do not deserialise into the requested type.
     /// `detail` carries the underlying codec error's message.
     Encoding {
         /// The underlying serialization error, as text.
@@ -90,7 +91,7 @@ impl WalError {
     }
 
     /// Build a [`WalError::Encoding`] from a codec error's message.
-    #[cfg(feature = "pack-io")]
+    #[cfg(any(feature = "pack-io", feature = "pack-io-2"))]
     pub(crate) fn encoding(detail: impl core::fmt::Display) -> Self {
         WalError::Encoding {
             detail: detail.to_string(),

@@ -80,7 +80,7 @@ That flush is not the same call on every platform, and getting it wrong is silen
 
 ```toml
 [dependencies]
-wal-db = "1.2"
+wal-db = "1.3"
 ```
 
 <br>
@@ -258,7 +258,7 @@ By default a record is bytes. With the `pack-io` feature, a record can be any ty
 
 ```toml
 [dependencies]
-wal-db = { version = "1.2", features = ["pack-io"] }
+wal-db = { version = "1.3", features = ["pack-io"] }
 ```
 
 ```rust
@@ -277,6 +277,8 @@ assert_eq!(event, Event { id: 1, name: "start".into() });
 # Ok(())
 # }
 ```
+
+`pack-io` 1.0's decoder is not bounded on hostile input, so `decode` only logs your program wrote. Since 1.3 the `pack-io-2` feature adds `append_pack`, `Record::unpack`, and `Record::unpack_with` through `pack-io` 2, whose decoder bounds allocation and nesting. They read records written with `append_typed` (the same values come back from the same bytes). Derived types name the re-exported crate: `#[pack_io(crate = "wal_db::pack_io2")]`.
 
 <br>
 
