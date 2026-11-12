@@ -80,7 +80,7 @@ That flush is not the same call on every platform, and getting it wrong is silen
 
 ```toml
 [dependencies]
-wal-db = "1.3"
+wal-db = "1.4"
 ```
 
 <br>
@@ -135,7 +135,7 @@ for entry in wal.iter()? {
 
 ### Strict open
 
-By default the open scan cuts everything from the first damaged record on. When the damage is in the middle of the log (bit rot, a bad sector, a missing segment file), that also cuts intact records after it. `OpenPolicy::Strict` refuses to open in that case, returning `WalError::Corruption` at the damaged record's offset with the log unchanged, and still cuts a damaged final record. `Wal::truncated_on_open` reports how many bytes an open cut, under either policy.
+By default the open scan cuts everything from the first damaged record on. When the damage is in the middle of the log (bit rot, a bad sector, a missing segment file), that also cuts intact records after it. `OpenPolicy::Strict` refuses to open in that case, returning `WalError::Corruption` at the damaged record's offset with the log unchanged, and still cuts a damaged final record. `Wal::truncated_on_open` reports how many bytes an open cut, under either policy. For a log that holds a database's durable state, prefer `Strict`: it never cuts a record that was acknowledged. Since 1.4 both policies refuse, rather than cut, a file whose first record does not verify, a log opened with another segment size, a log whose head marker was lost after a prefix drop, and an intact record longer than `max_record_size`.
 
 ```rust
 use wal_db::{OpenPolicy, Wal, WalConfig, WalError};
@@ -254,31 +254,32 @@ wal.sync()?;
 
 ## Typed records
 
-By default a record is bytes. With the `pack-io` feature, a record can be any type that derives `Serialize`/`Deserialize` — `append_typed` writes it, `Record::decode` reads it back. The derives come from the re-exported `wal_db::pack_io`, so no extra dependency is needed.
+By default a record is bytes. With the `pack-io-2` feature, a record can be any type that derives `Serialize`/`Deserialize`: `append_pack` writes it, and `Record::unpack` reads it back with bounded allocation and nesting, so a log from anywhere is safe to read. The derives come from the re-exported `wal_db::pack_io2`.
 
 ```toml
 [dependencies]
-wal-db = { version = "1.3", features = ["pack-io"] }
+wal-db = { version = "1.4", features = ["pack-io-2"] }
 ```
 
 ```rust
 use wal_db::{MemStore, Wal};
-use wal_db::pack_io::{Serialize, Deserialize};
+use wal_db::pack_io2::{Serialize, Deserialize};
 
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
+#[pack_io(crate = "wal_db::pack_io2")]
 struct Event { id: u64, name: String }
 
 # fn main() -> Result<(), wal_db::WalError> {
 let wal = Wal::with_store(MemStore::new())?;
-wal.append_typed(&Event { id: 1, name: "start".into() })?;
+wal.append_pack(&Event { id: 1, name: "start".into() })?;
 
-let event: Event = wal.iter()?.next().unwrap()?.decode()?;
+let event: Event = wal.iter()?.next().unwrap()?.unpack()?;
 assert_eq!(event, Event { id: 1, name: "start".into() });
 # Ok(())
 # }
 ```
 
-`pack-io` 1.0's decoder is not bounded on hostile input, so `decode` only logs your program wrote. Since 1.3 the `pack-io-2` feature adds `append_pack`, `Record::unpack`, and `Record::unpack_with` through `pack-io` 2, whose decoder bounds allocation and nesting. They read records written with `append_typed` (the same values come back from the same bytes). Derived types name the re-exported crate: `#[pack_io(crate = "wal_db::pack_io2")]`.
+The older `pack-io` feature (`append_typed`, `Record::decode`, through pack-io 1.0) stays for compatibility, but its decoder is not bounded on hostile input: a five-byte record can make it allocate 1 GiB. Decode with it only logs your program wrote; `unpack` reads the same records. In 2.0 `pack-io-2` replaces it.
 
 <br>
 
@@ -374,7 +375,7 @@ cargo bench --bench compare     # wal-db vs a hand-rolled inline WAL
 | [`recovery`](./examples/recovery.rs) | `cargo run --example recovery` | a simulated torn write and self-healing recovery |
 | [`concurrent`](./examples/concurrent.rs) | `cargo run --example concurrent` | many writers, one log, group commit |
 | [`checkpoint`](./examples/checkpoint.rs) | `cargo run --example checkpoint` | replay from a checkpoint (`iter_from`) and truncate back to one (`truncate_after`) |
-| [`typed`](./examples/typed.rs) | `cargo run --example typed --features pack-io` | typed records via `pack-io` |
+| [`typed`](./examples/typed.rs) | `cargo run --example typed --features pack-io-2` | typed records via `pack-io` 2 |
 
 <br>
 

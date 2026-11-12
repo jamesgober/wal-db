@@ -32,10 +32,16 @@ fn garbage_prefix_recovers_nothing() {
     // A file that begins with bytes that cannot form a valid record.
     fs::write(&path, b"this is not a wal-db record at all, just text").unwrap();
 
-    let wal = Wal::open(&path).unwrap();
-    assert_eq!(wal.iter().unwrap().count(), 0);
-    // The torn (here, entirely invalid) content is truncated away on open.
-    assert_eq!(wal.len(), 0);
+    // Since 1.4 a file whose first frame is whole but does not verify is
+    // refused, not emptied: it is not a log (or one damaged from its start).
+    assert!(matches!(
+        Wal::open(&path),
+        Err(wal_db::WalError::Corruption { offset: 0, .. })
+    ));
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        b"this is not a wal-db record at all, just text"
+    );
 }
 
 #[test]
@@ -48,9 +54,12 @@ fn implausible_length_is_rejected_without_allocating() {
     fs::write(&path, [0u8, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF]).unwrap();
 
     let config = WalConfig::new().with_max_record_size(1024);
-    let wal = Wal::open_with(&path, config).unwrap(); // must not try to allocate 4 GiB
-    assert_eq!(wal.iter().unwrap().count(), 0);
-    assert_eq!(wal.len(), 0);
+    // Must not try to allocate 4 GiB; since 1.4 the file is refused and kept.
+    assert!(matches!(
+        Wal::open_with(&path, config),
+        Err(wal_db::WalError::Corruption { offset: 0, .. })
+    ));
+    assert_eq!(fs::metadata(&path).unwrap().len(), 8);
 }
 
 #[test]

@@ -168,6 +168,24 @@ log's bytes `[k*S, (k+1)*S)`. The index is fixed-width so the files sort
 lexically into log order, and any file in the directory whose name is not exactly
 20 digits followed by `.wal` is ignored.
 
+Since 1.4 the directory also holds a file named `meta` that records `S`, so a
+log is never read with the wrong size (every offset would be wrong):
+
+```text
+        +--------------------+--------------------+--------------------+
+ field  | magic "WALSEGSZ"   | segment size S     | crc32c             |
+ type   | 8 bytes            | u64 (LE)           | u32 (LE)           |
+ offset | +0                 | +8                 | +16                |
+        +--------------------+--------------------+--------------------+
+```
+
+`crc32c` covers the first 16 bytes. An open with another size is refused. A log
+written before 1.4 has no `meta` file: on its first open the size is checked
+against the segment files (every segment but the last is full, so one longer
+than `S`, or none of them exactly `S` long, means another size) and then
+recorded. Readers before 1.4 ignore the file. It is written atomically through
+`meta.tmp`, like the `head` marker below.
+
 ### Mapping and spanning
 
 A logical byte at offset `O` lives in segment `O / S` at local offset `O % S`. A
@@ -186,7 +204,13 @@ Recovery is the same forward scan as above, reading through segment boundaries
 transparently. It ends when a read returns short — either a torn record (as
 above) or a missing segment file, which marks the end of the log. Suffix
 truncation to length `L` shrinks the segment containing `L` to `L % S` bytes and
-deletes every segment file with index greater than `L / S`.
+deletes every segment file with index greater than `L / S`; since 1.4, when `L`
+falls exactly on a boundary (`L % S == 0`), the segment `L / S` is deleted
+rather than left empty.
+
+Since 1.4 an open flushes every existing segment before recovery reads it (a
+process that stopped without syncing may have left bytes only in the page
+cache), and a sync flushes every segment written since its last flush.
 
 ### Prefix truncation and the `head` marker
 
@@ -216,11 +240,14 @@ leaves the old marker or the new one, and possibly a stale `head.tmp`, which
 readers ignore.
 
 On open, a marker that is missing, short, or whose checksum does not match is
-ignored and the head falls back to 0, so recovery reads the whole log. This is
-always safe: it never skips a live record — at worst a prefix that was meant to be
-dropped is read again. A reader that does not understand the `head` file ignores
-it entirely (it is not a `.wal` segment), which is correct only for logs that
-never had a prefix dropped.
+treated as absent. While segment 0 still exists the head falls back to 0 and
+recovery reads the whole log, which never skips a live record. Once a prefix has
+been dropped (the lowest segment is above 0), an unreadable marker leaves no
+safe place to start, so since 1.4 the open is refused with `Corruption` and
+nothing is deleted. (Before 1.4 the default open read from 0, found nothing,
+and cut the whole log.) A reader that does not understand the `head` file
+ignores it entirely (it is not a `.wal` segment), which is correct only for logs
+that never had a prefix dropped.
 
 <hr>
 <br>

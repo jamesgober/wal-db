@@ -88,6 +88,25 @@ fn bench_commit_single(c: &mut Criterion) {
     });
 }
 
+/// The segmented store, as a database uses it (16 MiB segments): an append
+/// alone, and an append made durable.
+fn bench_segmented(c: &mut Criterion) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let wal = Wal::open_segmented(dir.path().join("segments"), 16 * 1024 * 1024)
+        .expect("open log");
+    c.bench_function("append/single/segmented", |b| {
+        b.iter(|| wal.append(black_box(PAYLOAD)).expect("append"));
+    });
+    wal.sync().expect("sync");
+    c.bench_function("commit/single/segmented", |b| {
+        b.iter(|| {
+            let _ = wal
+                .append_and_sync(black_box(PAYLOAD))
+                .expect("append_and_sync");
+        });
+    });
+}
+
 fn bench_commit_group(c: &mut Criterion) {
     const THREADS: usize = 8;
     const OPS_PER_THREAD: usize = 16;
@@ -252,6 +271,7 @@ criterion_group!(
     bench_append_multi,
     bench_append_multi_filestore,
     bench_commit_single,
+    bench_segmented,
     bench_commit_group,
     bench_recovery,
     bench_strict_torn_tail

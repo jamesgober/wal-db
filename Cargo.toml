@@ -9,7 +9,7 @@
 #╚═══════════════════════════════╝
 [package]
 name    = "wal-db"
-version = "1.3.0"
+version = "1.4.0"
 
 rust-version = "1.85"
 edition = "2024"
@@ -85,6 +85,11 @@ criterion = { version = "0.5", features = ["html_reports"] }
 proptest  = "1"
 tempfile  = "3"
 
+# Linux only: `tests/page_cache.rs` reads the page cache's dirty count with
+# `cachestat(2)` to check that an acknowledged sync left nothing unflushed.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "0.2"
+
 # `loom` is a normal (not dev) dependency under `--cfg loom` only: the library's
 # own synchronization primitives switch to loom's instrumented types so the
 # model checker can verify the append and commit paths. It is never pulled into
@@ -104,7 +109,7 @@ harness = false
 # when that feature is enabled (e.g. `cargo run --example typed --features pack-io`).
 [[example]]
 name              = "typed"
-required-features = ["pack-io"]
+required-features = ["pack-io-2"]
 
 [profile.release]
 opt-level     = 3
