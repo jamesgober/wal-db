@@ -16,7 +16,7 @@ edition = "2024"
 license = "Apache-2.0 OR MIT"
 readme  = "README.md"
 
-description = "Write-ahead log primitive for Rust storage engines. Durable, recoverable, lock-free append path. The WAL substrate under lsm-db, txn-db, raft-io, and Hive DB."
+description = "Write-ahead log primitive for Rust storage engines. Durable, recoverable, lock-free append path. The WAL substrate under lsm-db, txn-db, and raft-io."
 
 keywords = [
     "wal",

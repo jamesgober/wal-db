@@ -6,8 +6,8 @@
 //! a state change is appended to a durable, append-only log *before* it is
 //! acknowledged, and that log is the source of truth used to rebuild state after
 //! a crash. `wal-db` publishes that primitive as a small, audited, benchmarked
-//! crate so the storage engines in the portfolio — `lsm-db`, `txn-db`,
-//! `raft-io`, Hive DB — share one well-tested implementation instead of each
+//! crate so the storage engines in the portfolio (`lsm-db`, `txn-db`,
+//! `raft-io`) share one well-tested implementation instead of each
 //! re-deriving the durability contract and getting it subtly wrong.
 //!
 //! ## The four-call API

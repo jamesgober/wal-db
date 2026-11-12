@@ -18,7 +18,7 @@
 
 <div align="left">
     <p>
-        <strong>wal-db</strong> is a <b>write-ahead log primitive</b> for Rust storage engines. It is the durability substrate underneath every database, transaction system, and distributed log in the portfolio — <code>lsm-db</code>, <code>txn-db</code>, <code>raft-io</code>, and Hive DB all build on it. The append path is <b>lock-free</b>, durability is <b>explicit</b> and <b>platform-correct</b> on Linux, macOS, and Windows, recovery is <b>provable</b> from a torn write, and concurrent commits <b>coalesce into a single fsync</b>.
+        <strong>wal-db</strong> is a <b>write-ahead log primitive</b> for Rust storage engines. It is the durability substrate underneath every database, transaction system, and distributed log in the portfolio: <code>lsm-db</code>, <code>txn-db</code>, and <code>raft-io</code> all build on it. The append path is <b>lock-free</b>, durability is <b>explicit</b> and <b>platform-correct</b> on Linux, macOS, and Windows, recovery is <b>provable</b> from a torn write, and concurrent commits <b>coalesce into a single fsync</b>.
     </p>
     <p>
         A WAL is the workhorse no database can avoid: every state change is appended to a durable log <em>before</em> it is acknowledged, and the log is the source of truth used to rebuild state after a crash. Most Rust databases ship their WAL privately inside the engine; <code>wal-db</code> publishes it as a clean, composable primitive so multiple storage engines (LSM, B-tree, document store) can share a single, well-tested implementation.
@@ -402,7 +402,6 @@ The `loom` run model-checks the lock-free append and the group-commit handshake:
 - [`lsm-db`](https://github.com/jamesgober/lsm-db) — memtable durability
 - [`txn-db`](https://github.com/jamesgober/txn-db) — transaction log
 - [`raft-io`](https://github.com/jamesgober/raft-io) — Raft log persistence
-- Hive DB — primary write-ahead log
 
 It stays foreign-compatible: usable standalone in any project that needs a durable append-only log.
 
