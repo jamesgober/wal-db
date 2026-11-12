@@ -338,10 +338,7 @@ fn segmented_strict_refuses_a_torn_head_marker_after_prefix_compaction() {
     assert!(!before.is_empty());
 
     let refused = Wal::open_segmented_with(dir.path(), 64, strict());
-    assert!(matches!(
-        refused,
-        Err(WalError::Corruption { offset: 0, .. })
-    ));
+    assert!(matches!(refused, Err(WalError::Corruption { .. })));
     assert_eq!(segment_files(dir.path()), before);
 }
 
@@ -453,9 +450,20 @@ proptest! {
             Err(WalError::Corruption { offset, .. }) => prop_assert_eq!(offset, lsns[victim]),
             other => prop_assert!(false, "expected Corruption, got {:?}", other.map(|_| ())),
         }
-        prop_assert_eq!(fs::read(&path).unwrap(), before);
+        prop_assert_eq!(&fs::read(&path).unwrap(), &before);
 
-        let lenient = Wal::open(&path).unwrap();
-        prop_assert_eq!(read_all(&lenient), records[..victim].to_vec());
+        // Damage in the first record leaves nothing that verifies at the start:
+        // the default open refuses and keeps the file, unless the damage made
+        // the first frame look cut short (a length past the end), which it
+        // cuts as a torn tail.
+        match Wal::open(&path) {
+            Ok(lenient) => prop_assert_eq!(read_all(&lenient), records[..victim].to_vec()),
+            Err(WalError::Corruption { offset, .. }) => {
+                prop_assert_eq!(victim, 0);
+                prop_assert_eq!(offset, 0);
+                prop_assert_eq!(fs::read(&path).unwrap(), before);
+            }
+            Err(other) => prop_assert!(false, "unexpected {:?}", other),
+        }
     }
 }

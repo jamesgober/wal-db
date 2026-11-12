@@ -136,6 +136,24 @@ impl Commit {
     /// made durable. After a failed flush, every target past the durable
     /// watermark returns [`WalError::Io`] until the log is reopened; waiters
     /// must not retry the flush, because a retry can succeed without the data.
+    /// Flush the store now, outside the group-commit protocol (for a
+    /// truncation, with writers quiesced). A failure is permanent for this
+    /// handle, as in [`sync_to`](Self::sync_to); after an earlier failure it
+    /// fails at once.
+    pub(crate) fn sync_now<S: WalStore>(&self, store: &S) -> Result<()> {
+        if self.lock().flush_failed {
+            return Err(WalError::io(
+                "flushing to stable storage",
+                io::Error::other("an earlier flush failed; reopen the log"),
+            ));
+        }
+        let result = store.sync();
+        if result.is_err() {
+            self.lock().flush_failed = true;
+        }
+        result
+    }
+
     pub(crate) fn sync_to<S: WalStore>(&self, store: &S, target: u64) -> Result<()> {
         let mut state = self.lock();
         loop {

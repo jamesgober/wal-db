@@ -18,6 +18,70 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [1.4.0] - 2026-11-12
+
+Durability and data-safety fixes from an independent review. The record
+format is unchanged and every existing log opens; segmented logs gain a `meta`
+file that records their segment size, which older readers ignore.
+
+### Fixed
+
+- **A segmented log acknowledged records whose bytes were not on disk**
+  (critical). `SegmentedStore::sync` chose the segments to flush from the
+  highest byte written, so bytes written late into an older segment (a record
+  whose writer finished after a later one, under group commit), or left
+  unflushed by a process that stopped, were reported durable while dirty in
+  the page cache. Each segment now carries a dirty flag set by every write and
+  cleared by the sync that flushes it, and a sync flushes every dirty segment;
+  an open flushes every existing segment before recovery reads it.
+  `tests/page_cache.rs` (Linux 6.5+, run in CI) reads the page cache's dirty
+  count with `cachestat(2)` after an acknowledged sync and finds none.
+- **A lost or damaged `head` marker deleted a segmented log** once a prefix
+  had been dropped: the default open read from offset 0, found nothing, and cut
+  every segment. The open is now refused with `Corruption` and nothing is
+  deleted.
+- **Reopening with another segment size deleted a segmented log.** The size is
+  now recorded in a checksummed `meta` file and an open with another size is
+  refused. For a log from before 1.4 the size is checked against the segment
+  files on the first open, then recorded.
+- **A file that is not a log was emptied by `Wal::open`** under both policies.
+  When nothing at the start of the log verifies and the frame there is whole
+  (not a write cut short, and not zeros the file system never wrote), the open
+  is refused and the file kept.
+- **`truncate_before` accepted an offset that is not a record boundary** and
+  made it the durable head, so the next open cut the log. It now checks that
+  an intact record starts there.
+- **Reopening with a lower `max_record_size` cut intact records** under the
+  default policy. An intact record above the limit is now refused, as `Strict`
+  already did.
+- **`truncate_after` at a segment boundary** emptied the next segment without
+  flushing the shrink; that segment is now removed, and a segment shrunk by a
+  truncation is flushed at once.
+- **A panic inside `append`** (a custom store) left its reserved range neither
+  written nor failed, so every later sync waited forever. A guard now marks it
+  failed, and later syncs return an error.
+- **A failed sync inside `truncate_after`** did not mark the log's flush as
+  failed and left the log's end past the file; the end now moves first and the
+  failure is permanent for the handle, like any other.
+- Recovery no longer allocates a record's declared length before checking
+  that the store holds that many bytes.
+
+### Changed
+
+- The `typed` example, the README, and the crate docs use the `pack-io-2`
+  feature (`append_pack`, `Record::unpack`). `Record::decode` (feature
+  `pack-io`) documents that a five-byte record can make pack-io 1.0 allocate
+  1 GiB.
+- `truncate_after` documents that the records appended next reuse the dropped
+  records' LSNs.
+- The README recommends `OpenPolicy::Strict` for a log that holds durable
+  state.
+
+Cost: an open of a segmented log flushes each existing segment once (a no-op
+for pages already on disk); a sync visits the open segments' dirty flags.
+
+---
+
 ## [1.3.0] - 2026-11-11
 
 Typed records through `pack-io` 2, whose decoder is bounded on hostile
@@ -587,7 +651,8 @@ Initial scaffold and repository bootstrap. No WAL logic yet — this release est
 - `.gitattributes` normalising line endings and excluding development paths from archives.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) — gitignored.
 
-[Unreleased]: https://github.com/jamesgober/wal-db/compare/v1.3.0...HEAD
+[Unreleased]: https://github.com/jamesgober/wal-db/compare/v1.4.0...HEAD
+[1.4.0]: https://github.com/jamesgober/wal-db/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/jamesgober/wal-db/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/jamesgober/wal-db/compare/v1.1.1...v1.2.0
 [1.1.1]: https://github.com/jamesgober/wal-db/compare/v1.1.0...v1.1.1

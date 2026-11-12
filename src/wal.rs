@@ -348,15 +348,20 @@ impl<S: WalStore> Wal<S> {
             }
         };
 
+        // A write that panics poisons its range on the way out, so syncs that
+        // cover it fail instead of waiting forever for the gap to fill.
+        let guard = Reserved {
+            commit: &self.commit,
+            start,
+            armed: true,
+        };
         match self.frame_and_write(start, record) {
             Ok(()) => {
+                guard.disarm();
                 self.commit.mark_written(start, end);
                 Ok(Lsn::new(start))
             }
-            Err(error) => {
-                self.commit.mark_failed(start);
-                Err(error)
-            }
+            Err(error) => Err(error), // the guard marks the range failed
         }
     }
 
@@ -590,7 +595,8 @@ impl<S: WalStore> Wal<S> {
     /// including it. For compaction.
     ///
     /// The record at `lsn` becomes the new last record; the next append lands
-    /// right after it. The truncation is made durable before returning. `lsn`
+    /// right after it, so the records appended next take the LSNs the dropped
+    /// ones had. The truncation is made durable before returning. `lsn`
     /// must be a real record boundary from a previous [`append`](Wal::append) or
     /// [`iter`](Wal::iter), and the record there must be intact.
     ///
@@ -627,9 +633,23 @@ impl<S: WalStore> Wal<S> {
     /// # }
     /// ```
     pub fn truncate_after(&self, lsn: Lsn) -> Result<()> {
-        let start = lsn.get();
+        let new_end = self.record_end(lsn.get())?;
+        self.store.truncate(new_end)?;
+        // The log's end moves before the sync, so whatever the sync's outcome
+        // the next append lands at the new end, never past a gap; and the sync
+        // goes through the commit layer, so a failed one is permanent for this
+        // handle like any other.
+        self.tail.0.store(new_end, Ordering::Release);
+        self.commit.reset(new_end);
+        self.commit.sync_now(&self.store)
+    }
 
-        // Confirm an intact record really lives at `lsn` before keeping it.
+    /// The end of the intact record at `start`.
+    ///
+    /// # Errors
+    ///
+    /// [`WalError::Corruption`] if no intact record starts at `start`.
+    fn record_end(&self, start: u64) -> Result<u64> {
         let mut header = [0u8; HEADER_LEN];
         if self.store.read_at(start, &mut header)? < HEADER_LEN {
             return Err(WalError::corruption(start, "no record at this LSN"));
@@ -641,6 +661,12 @@ impl<S: WalStore> Wal<S> {
         let payload_start = start
             .checked_add(HEADER_LEN as u64)
             .ok_or_else(|| WalError::corruption(start, "record offset overflow"))?;
+        let end = payload_start
+            .checked_add(u64::from(parsed.len))
+            .ok_or_else(|| WalError::corruption(start, "record offset overflow"))?;
+        if end > self.store.len()? {
+            return Err(WalError::corruption(start, "incomplete record at this LSN"));
+        }
         let mut payload = vec![0u8; parsed.len as usize];
         if self.store.read_at(payload_start, &mut payload)? < payload.len() {
             return Err(WalError::corruption(start, "incomplete record at this LSN"));
@@ -648,15 +674,7 @@ impl<S: WalStore> Wal<S> {
         if !record::verify(&header, &payload, parsed.crc) {
             return Err(WalError::corruption(start, "no valid record at this LSN"));
         }
-        let new_end = payload_start
-            .checked_add(u64::from(parsed.len))
-            .ok_or_else(|| WalError::corruption(start, "record offset overflow"))?;
-
-        self.store.truncate(new_end)?;
-        self.store.sync()?;
-        self.tail.0.store(new_end, Ordering::Release);
-        self.commit.reset(new_end);
-        Ok(())
+        Ok(end)
     }
 
     /// Drop the records before the one at `lsn`, keeping the log from there on,
@@ -687,7 +705,11 @@ impl<S: WalStore> Wal<S> {
     ///
     /// # Errors
     ///
-    /// Returns [`WalError::Io`] if the removal fails.
+    /// - [`WalError::Corruption`] if no intact record starts at `lsn` (and
+    ///   `lsn` is neither below the current head nor at the end of the log):
+    ///   the head is a record boundary, and a wrong one would make the next
+    ///   open read the log from a place that is not a record.
+    /// - [`WalError::Io`] if the removal fails.
     ///
     /// # Examples
     ///
@@ -712,7 +734,11 @@ impl<S: WalStore> Wal<S> {
     /// # }
     /// ```
     pub fn truncate_before(&self, lsn: Lsn) -> Result<Lsn> {
-        let new_head = self.store.truncate_before(lsn.get())?;
+        let at = lsn.get();
+        if at > self.head.load(Ordering::Acquire) && at < self.store.len()? {
+            let _ = self.record_end(at)?;
+        }
+        let new_head = self.store.truncate_before(at)?;
         self.head.store(new_head, Ordering::Release);
         Ok(Lsn::new(new_head))
     }
@@ -766,6 +792,39 @@ fn with_frame_buffer<R>(f: impl FnOnce(&mut Vec<u8>) -> R) -> R {
     f(&mut buf)
 }
 
+/// Why the open scan stopped before the end of the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stop {
+    /// The frame there is incomplete: a write cut short.
+    Torn,
+    /// Its length is above `max_record_size`.
+    Oversized,
+    /// A whole frame whose checksum does not match.
+    Damaged,
+}
+
+/// A reserved byte range not yet written: poisoned when dropped unless
+/// [`disarm`](Self::disarm)ed, so a panicking write cannot wedge later syncs.
+struct Reserved<'a> {
+    commit: &'a Commit,
+    start: u64,
+    armed: bool,
+}
+
+impl Reserved<'_> {
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for Reserved<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.commit.mark_failed(self.start);
+        }
+    }
+}
+
 /// What the open scan recovered.
 #[derive(Debug, Clone, Copy)]
 struct Recovered {
@@ -791,19 +850,32 @@ fn recover<S: WalStore>(store: &S, config: &WalConfig, head: u64) -> Result<Reco
     // bytes, so the buffer is refilled per record rather than reallocated.
     let mut payload = Vec::new();
 
+    // How the scan stopped: only an incomplete frame is a torn write.
+    let mut stop = Stop::Torn;
     while offset < physical {
         if store.read_at(offset, &mut header)? < HEADER_LEN {
             break; // incomplete header: torn tail
         }
+        // Zeros are bytes the file system never wrote (it may extend a file
+        // before its data reaches the disk): a torn tail, not damage.
+        if header == [0u8; HEADER_LEN] {
+            break;
+        }
         let parsed = record::parse_header(&header);
         if parsed.len > max_record_size {
-            break; // implausible length: treat the rest as a torn tail
+            stop = Stop::Oversized;
+            break;
         }
 
         let payload_start = match offset.checked_add(HEADER_LEN as u64) {
             Some(start) => start,
             None => break,
         };
+        // A length the store cannot back is a torn tail: checked before any
+        // buffer is sized from it.
+        if payload_start.saturating_add(u64::from(parsed.len)) > physical {
+            break;
+        }
         let len = parsed.len as usize;
         payload.clear();
         payload.resize(len, 0);
@@ -811,7 +883,8 @@ fn recover<S: WalStore>(store: &S, config: &WalConfig, head: u64) -> Result<Reco
             break; // incomplete payload: torn tail
         }
         if !record::verify(&header, &payload, parsed.crc) {
-            break; // checksum mismatch: stop here
+            stop = Stop::Damaged;
+            break;
         }
 
         offset = match payload_start.checked_add(u64::from(parsed.len)) {
@@ -821,6 +894,32 @@ fn recover<S: WalStore>(store: &S, config: &WalConfig, head: u64) -> Result<Reco
     }
 
     if offset < physical {
+        // An intact record longer than `max_record_size` (a log written with
+        // a higher limit) is never cut as if it were damage.
+        if stop == Stop::Oversized
+            && config.open_policy() != OpenPolicy::Strict
+            && strict::classify(store, max_record_size, offset, physical)? == Tail::Oversized
+        {
+            return Err(WalError::corruption(
+                offset,
+                "an intact record is longer than max_record_size",
+            ));
+        }
+        // Nothing at the head verifies, and what is there is a whole frame
+        // that does not check (or a length past the limit), not a write cut
+        // short: this is not a log, or one damaged from its first record.
+        // Cutting would empty it, so refuse under every policy (after the
+        // strict checks below, which say more when they apply).
+        let refuse_at_head = offset == head && stop != Stop::Torn;
+        let not_a_log = || {
+            WalError::corruption(
+                offset,
+                "nothing at the start of the log verifies: not a log, or one damaged from its first record",
+            )
+        };
+        if refuse_at_head && config.open_policy() != OpenPolicy::Strict {
+            return Err(not_a_log());
+        }
         if config.open_policy() == OpenPolicy::Strict {
             match strict::classify(store, max_record_size, offset, physical)? {
                 Tail::Torn => {}
@@ -842,6 +941,9 @@ fn recover<S: WalStore>(store: &S, config: &WalConfig, head: u64) -> Result<Reco
                         "an intact record is longer than max_record_size",
                     ));
                 }
+            }
+            if refuse_at_head {
+                return Err(not_a_log());
             }
         }
         store.truncate(offset)?;
@@ -907,8 +1009,8 @@ impl Record {
     ///
     /// # Untrusted bytes
     ///
-    /// `pack-io` 1.0's decoder is not bounded on hostile input: a few crafted
-    /// bytes can make it allocate hundreds of MiB. A record's CRC32C catches
+    /// `pack-io` 1.0's decoder is not bounded on hostile input: a five-byte
+    /// record can make it allocate 1 GiB. A record's CRC32C catches
     /// damage, not a log written by someone else. Decode only logs this
     /// program wrote; for any other, use [`unpack`](Record::unpack) (feature
     /// `pack-io-2`), which reads the same records with bounded allocation and

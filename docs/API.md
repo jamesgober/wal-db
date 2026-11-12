@@ -92,10 +92,10 @@ iterator-based and stops at the first torn or corrupt record.
 
 ```toml
 [dependencies]
-wal-db = "1.3"
+wal-db = "1.4"
 
 # Typed records via pack-io:
-wal-db = { version = "1.3", features = ["pack-io"] }
+wal-db = { version = "1.4", features = ["pack-io"] }
 ```
 
 The default feature set is empty; the crate is standard-library only.

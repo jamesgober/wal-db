@@ -46,6 +46,16 @@ const HEAD_FILE: &str = "head";
 const HEAD_TMP_FILE: &str = "head.tmp";
 /// Size of the head marker: an 8-byte offset plus a 4-byte CRC32C of it.
 const HEAD_FILE_LEN: usize = 12;
+/// Name of the file that records the segment size the log was written with
+/// (since 1.4). Readers before 1.4 ignore it.
+const META_FILE: &str = "meta";
+/// Written here, flushed, and renamed over [`META_FILE`].
+const META_TMP_FILE: &str = "meta.tmp";
+/// The meta file's magic.
+const META_MAGIC: &[u8; 8] = b"WALSEGSZ";
+/// Size of the meta file: magic, the segment size as a u64, and a CRC32C of
+/// both.
+const META_FILE_LEN: usize = 8 + 8 + 4;
 
 /// A [`WalStore`] that stripes one flat byte space across fixed-size segment
 /// files in a directory.
@@ -54,7 +64,11 @@ const HEAD_FILE_LEN: usize = 12;
 /// [`Wal::with_store`](crate::Wal::with_store), or use the
 /// [`Wal::open_segmented`](crate::Wal::open_segmented) convenience constructor.
 /// Segments are created lazily as the log grows, and [`sync`](WalStore::sync)
-/// flushes only the segments with unwritten changes, not the whole history.
+/// flushes every segment written since the last sync, not the whole history.
+///
+/// The segment size is recorded in a `meta` file next to the segments; opening
+/// with another size is refused rather than reading the bytes at the wrong
+/// offsets.
 ///
 /// # Examples
 ///
@@ -75,13 +89,9 @@ const HEAD_FILE_LEN: usize = 12;
 pub struct SegmentedStore {
     dir: PathBuf,
     segment_size: u64,
-    segments: RwLock<HashMap<u64, Arc<File>>>,
-    /// Highest byte offset ever written, used to decide which segments still
-    /// need flushing.
+    segments: RwLock<HashMap<u64, Arc<Segment>>>,
+    /// Highest byte offset ever written: the logical length.
     max_written: AtomicU64,
-    /// Index of the lowest segment that may still have unflushed writes. Every
-    /// segment below it is full and durable, so `sync` skips it.
-    synced_from: AtomicU64,
     /// Lowest offset still present — the start of the lowest segment that has not
     /// been dropped by `truncate_before`. Recovery scans from here.
     head: AtomicU64,
@@ -93,6 +103,27 @@ pub struct SegmentedStore {
     parent_dirty: AtomicBool,
 }
 
+/// One open segment file and whether it holds bytes written since its last
+/// flush.
+#[derive(Debug)]
+struct Segment {
+    file: File,
+    /// Set after every write to the segment; cleared by the sync that flushes
+    /// it. A sync flushes every segment with the flag set, so bytes written
+    /// late into an older segment (a record whose writer finished after a
+    /// later one) are flushed by the sync that covers them.
+    dirty: AtomicBool,
+}
+
+impl Segment {
+    fn new(file: File, dirty: bool) -> Arc<Segment> {
+        Arc::new(Segment {
+            file,
+            dirty: AtomicBool::new(dirty),
+        })
+    }
+}
+
 impl SegmentedStore {
     /// Open the segmented log in `dir`, creating the directory if needed, with
     /// segments of `segment_size` bytes.
@@ -100,12 +131,17 @@ impl SegmentedStore {
     /// Existing segment files are picked up so the log can be recovered. The
     /// store does not validate record contents — that is
     /// [`Wal::open`](crate::Wal::open)'s recovery scan, which runs unchanged over
-    /// the flat space.
+    /// the flat space. Every existing segment is flushed first: a process that
+    /// stopped without syncing may have left bytes only in the page cache, and
+    /// recovery must not trust what a power loss could still take away.
     ///
     /// # Errors
     ///
-    /// Returns [`WalError::Io`] if `segment_size` is zero, or if the directory
-    /// cannot be created or read.
+    /// - [`WalError::Io`] if `segment_size` is zero, or if the directory or a
+    ///   segment cannot be created, read, or flushed.
+    /// - [`WalError::Corruption`] if the log was written with another segment
+    ///   size, or if its first segments were dropped and the head marker that
+    ///   says where it now starts is missing or damaged. Nothing is deleted.
     pub fn open(dir: impl AsRef<Path>, segment_size: u64) -> Result<Self> {
         if segment_size == 0 {
             return Err(WalError::io(
@@ -117,8 +153,8 @@ impl SegmentedStore {
         let created = !dir.is_dir();
         fs::create_dir_all(&dir).map_err(|e| WalError::io("creating the log directory", e))?;
 
-        // Find the highest existing segment to compute the current logical length.
-        let mut highest: Option<(u64, u64)> = None; // (index, file length)
+        // Every segment, by index, with its file length.
+        let mut found: Vec<(u64, u64)> = Vec::new();
         for entry in fs::read_dir(&dir).map_err(|e| WalError::io("reading the log directory", e))? {
             let entry = entry.map_err(|e| WalError::io("reading the log directory", e))?;
             if let Some(index) = parse_segment_name(&entry.file_name()) {
@@ -126,29 +162,57 @@ impl SegmentedStore {
                     .metadata()
                     .map_err(|e| WalError::io("reading segment metadata", e))?
                     .len();
-                if highest.is_none_or(|(h, _)| index > h) {
-                    highest = Some((index, len));
-                }
+                found.push((index, len));
             }
         }
+        found.sort_unstable();
 
-        let total_len = match highest {
-            Some((index, len)) => index.saturating_mul(segment_size).saturating_add(len),
+        check_segment_size(&dir, segment_size, &found)?;
+
+        let total_len = match found.last() {
+            Some(&(index, len)) => index.saturating_mul(segment_size).saturating_add(len),
             None => 0,
         };
-        let active = total_len / segment_size;
         // The head is the exact record boundary recorded by the last prefix
         // truncation, or 0 for a log that has never had one. It is durable, so
         // recovery resumes from the same place after a crash.
-        let head = read_head_file(&dir)?.unwrap_or(0).min(total_len);
+        let lowest = found.first().map_or(0, |&(index, _)| index);
+        let head = match read_head_file(&dir)? {
+            Some(head) => head.min(total_len),
+            // No marker (or a damaged one) and segment 0 still here: the whole
+            // log is present and recovery reads it from the start.
+            None if lowest == 0 => 0,
+            None => {
+                return Err(WalError::corruption(
+                    lowest.saturating_mul(segment_size),
+                    "the log's first segments were dropped and its head marker is missing or damaged",
+                ));
+            }
+        };
+        if !found.is_empty() && head / segment_size < lowest {
+            return Err(WalError::corruption(
+                head,
+                "the segment holding the log's head is missing",
+            ));
+        }
+
+        // Flush every segment before recovery reads it, and keep the handles.
+        let mut segments = HashMap::with_capacity(found.len());
+        for &(index, _) in &found {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(dir.join(segment_name(index)))
+                .map_err(|e| WalError::io("opening a log segment", e))?;
+            durable_sync(&file).map_err(|e| WalError::io("flushing a log segment", e))?;
+            let _ = segments.insert(index, Segment::new(file, false));
+        }
 
         Ok(SegmentedStore {
             dir,
             segment_size,
-            segments: RwLock::new(HashMap::new()),
+            segments: RwLock::new(segments),
             max_written: AtomicU64::new(total_len),
-            // Everything already on disk is treated as durable on open.
-            synced_from: AtomicU64::new(active),
             head: AtomicU64::new(head),
             dir_dirty: AtomicBool::new(true),
             parent_dirty: AtomicBool::new(created),
@@ -167,25 +231,24 @@ impl SegmentedStore {
         self.segment_size
     }
 
-    fn read_map(&self) -> RwLockReadGuard<'_, HashMap<u64, Arc<File>>> {
+    fn read_map(&self) -> RwLockReadGuard<'_, HashMap<u64, Arc<Segment>>> {
         self.segments.read().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn write_map(&self) -> RwLockWriteGuard<'_, HashMap<u64, Arc<File>>> {
+    fn write_map(&self) -> RwLockWriteGuard<'_, HashMap<u64, Arc<Segment>>> {
         self.segments
             .write()
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Get the handle for segment `index`, creating the file if it does not
-    /// exist yet.
-    fn segment_for_write(&self, index: u64) -> Result<Arc<File>> {
-        if let Some(file) = self.read_map().get(&index) {
-            return Ok(Arc::clone(file));
+    /// Get segment `index`, creating the file if it does not exist yet.
+    fn segment_for_write(&self, index: u64) -> Result<Arc<Segment>> {
+        if let Some(segment) = self.read_map().get(&index) {
+            return Ok(Arc::clone(segment));
         }
         let mut map = self.write_map();
-        if let Some(file) = map.get(&index) {
-            return Ok(Arc::clone(file));
+        if let Some(segment) = map.get(&index) {
+            return Ok(Arc::clone(segment));
         }
         let path = self.dir.join(segment_name(index));
         let file = OpenOptions::new()
@@ -199,36 +262,31 @@ impl SegmentedStore {
         // flushes the new name. The append path pays one atomic store per
         // segment; the directory flush itself happens in `sync`.
         self.dir_dirty.store(true, Ordering::Release);
-        let file = Arc::new(file);
-        let _ = map.insert(index, Arc::clone(&file));
-        Ok(file)
+        let segment = Segment::new(file, false);
+        let _ = map.insert(index, Arc::clone(&segment));
+        Ok(segment)
     }
 
-    /// Get the handle for segment `index` only if it already exists, without
-    /// creating it. `None` means the log ends before this segment.
-    fn segment_for_read(&self, index: u64) -> Result<Option<Arc<File>>> {
-        if let Some(file) = self.read_map().get(&index) {
-            return Ok(Some(Arc::clone(file)));
+    /// Get segment `index` only if it already exists, without creating it.
+    /// `None` means the log ends before this segment.
+    fn segment_for_read(&self, index: u64) -> Result<Option<Arc<Segment>>> {
+        if let Some(segment) = self.read_map().get(&index) {
+            return Ok(Some(Arc::clone(segment)));
         }
         let path = self.dir.join(segment_name(index));
         match OpenOptions::new().read(true).write(true).open(&path) {
             Ok(file) => {
-                let file = Arc::new(file);
                 let mut map = self.write_map();
                 if let Some(existing) = map.get(&index) {
                     return Ok(Some(Arc::clone(existing)));
                 }
-                let _ = map.insert(index, Arc::clone(&file));
-                Ok(Some(file))
+                let segment = Segment::new(file, false);
+                let _ = map.insert(index, Arc::clone(&segment));
+                Ok(Some(segment))
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(WalError::io("opening a log segment", error)),
         }
-    }
-
-    /// Look up an already-open segment without touching the filesystem.
-    fn open_segment(&self, index: u64) -> Option<Arc<File>> {
-        self.read_map().get(&index).map(Arc::clone)
     }
 
     /// Durably record `head` so a later open resumes from the same boundary.
@@ -241,31 +299,98 @@ impl SegmentedStore {
         buf[..8].copy_from_slice(&head.to_le_bytes());
         let crc = crate::crc::crc32c(&buf[..8]);
         buf[8..].copy_from_slice(&crc.to_le_bytes());
-
-        let tmp = self.dir.join(HEAD_TMP_FILE);
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp)
-            .map_err(|e| WalError::io("writing the head marker", e))?;
-        pwrite_all(&file, 0, &buf).map_err(|e| WalError::io("writing the head marker", e))?;
-        durable_sync(&file).map_err(|e| WalError::io("flushing the head marker", e))?;
-        // Windows refuses to rename a file that still has an open handle.
-        drop(file);
-
-        fs::rename(&tmp, self.dir.join(HEAD_FILE))
-            .map_err(|e| WalError::io("replacing the head marker", e))?;
-        sync_dir(&self.dir).map_err(|e| WalError::io("flushing the log directory", e))
+        write_small_file(&self.dir, HEAD_TMP_FILE, HEAD_FILE, &buf, "the head marker")
     }
 }
 
-/// Read the durably recorded head, or `None` if no prefix has been dropped.
+/// Write `bytes` to `dir/name` atomically and durably: through `tmp`,
+/// flushed, renamed over `name`, and the directory flushed.
+fn write_small_file(
+    dir: &Path,
+    tmp: &str,
+    name: &str,
+    bytes: &[u8],
+    what: &'static str,
+) -> Result<()> {
+    let tmp = dir.join(tmp);
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp)
+        .map_err(|e| WalError::io(what, e))?;
+    pwrite_all(&file, 0, bytes).map_err(|e| WalError::io(what, e))?;
+    durable_sync(&file).map_err(|e| WalError::io(what, e))?;
+    // Windows refuses to rename a file that still has an open handle.
+    drop(file);
+    fs::rename(&tmp, dir.join(name)).map_err(|e| WalError::io(what, e))?;
+    sync_dir(dir).map_err(|e| WalError::io("flushing the log directory", e))
+}
+
+/// Check `segment_size` against the size the log in `dir` was written with,
+/// and record it for a log that has no record of it yet.
 ///
-/// A marker that is absent, too short, or whose checksum does not match is taken
-/// as `None`, so the head falls back to 0 and recovery reads the whole log. That
-/// is always safe: a dropped prefix that the marker can no longer vouch for is
-/// simply re-read, never skipped.
+/// A log from 1.4 on records its size in the `meta` file. For an older log
+/// the segments' lengths tell: every segment before the last one is full, so
+/// one that is longer than `segment_size`, or a set of them none of which is
+/// exactly `segment_size` long, means another size. (A segment before the
+/// last may be short only if a crash cut writes that were still in flight.)
+fn check_segment_size(dir: &Path, segment_size: u64, found: &[(u64, u64)]) -> Result<()> {
+    let mismatch = || {
+        WalError::corruption(
+            0,
+            "the log was written with another segment size: open it with that size",
+        )
+    };
+    if let Some(recorded) = read_meta_file(dir)? {
+        return if recorded == segment_size {
+            Ok(())
+        } else {
+            Err(mismatch())
+        };
+    }
+    let before_last = found.len().saturating_sub(1);
+    let full = &found[..before_last];
+    if found.iter().any(|&(_, len)| len > segment_size)
+        || (!full.is_empty() && !full.iter().any(|&(_, len)| len == segment_size))
+    {
+        return Err(mismatch());
+    }
+    let mut buf = [0u8; META_FILE_LEN];
+    buf[..8].copy_from_slice(META_MAGIC);
+    buf[8..16].copy_from_slice(&segment_size.to_le_bytes());
+    let crc = crate::crc::crc32c(&buf[..16]);
+    buf[16..].copy_from_slice(&crc.to_le_bytes());
+    write_small_file(dir, META_TMP_FILE, META_FILE, &buf, "the log's meta file")
+}
+
+/// The segment size recorded in the meta file, or `None` when there is none.
+fn read_meta_file(dir: &Path) -> Result<Option<u64>> {
+    match fs::read(dir.join(META_FILE)) {
+        Ok(bytes) => {
+            if bytes.len() != META_FILE_LEN
+                || &bytes[..8] != META_MAGIC
+                || crate::crc::crc32c(&bytes[..16])
+                    != u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]])
+            {
+                return Err(WalError::corruption(0, "the log's meta file is damaged"));
+            }
+            let mut size = [0u8; 8];
+            size.copy_from_slice(&bytes[8..16]);
+            Ok(Some(u64::from_le_bytes(size)))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(WalError::io("reading the log's meta file", error)),
+    }
+}
+
+/// Read the durably recorded head, or `None` if no prefix has been dropped
+/// or the marker is unreadable.
+///
+/// A marker that is absent, too short, or whose checksum does not match is
+/// `None`. The caller then reads the log from 0 only if segment 0 is still
+/// there; once a prefix has been dropped it refuses to open instead, since
+/// recovery from 0 would find nothing and cut the log.
 fn read_head_file(dir: &Path) -> Result<Option<u64>> {
     match fs::read(dir.join(HEAD_FILE)) {
         Ok(bytes) if bytes.len() >= HEAD_FILE_LEN => {
@@ -276,7 +401,7 @@ fn read_head_file(dir: &Path) -> Result<Option<u64>> {
             if crate::crc::crc32c(&bytes[..8]) == stored {
                 Ok(Some(head))
             } else {
-                Ok(None) // torn or corrupt marker: fall back to full recovery
+                Ok(None)
             }
         }
         Ok(_) => Ok(None),
@@ -295,9 +420,12 @@ impl WalStore for SegmentedStore {
             let room = (self.segment_size - local) as usize;
             let take = remaining.len().min(room);
 
-            let file = self.segment_for_write(index)?;
-            pwrite_all(&file, local, &remaining[..take])
+            let segment = self.segment_for_write(index)?;
+            pwrite_all(&segment.file, local, &remaining[..take])
                 .map_err(|e| WalError::io("writing a record", e))?;
+            // After the bytes are in the file: a sync that reads the flag as set
+            // flushes them; one that cleared it just before has flushed them too.
+            segment.dirty.store(true, Ordering::Release);
 
             pos += take as u64;
             remaining = &remaining[take..];
@@ -316,10 +444,10 @@ impl WalStore for SegmentedStore {
             let room = (self.segment_size - local) as usize;
             let want = (buf.len() - filled).min(room);
 
-            let Some(file) = self.segment_for_read(index)? else {
+            let Some(segment) = self.segment_for_read(index)? else {
                 break; // no such segment: the log ends here
             };
-            let got = pread_fill(&file, local, &mut buf[filled..filled + want])
+            let got = pread_fill(&segment.file, local, &mut buf[filled..filled + want])
                 .map_err(|e| WalError::io("reading from the log", e))?;
             filled += got;
             pos += got as u64;
@@ -342,28 +470,30 @@ impl WalStore for SegmentedStore {
             let Some(index) = parse_segment_name(&entry.file_name()) else {
                 continue;
             };
-            match index.cmp(&last_index) {
-                std::cmp::Ordering::Greater => {
-                    // Entirely past the new end: drop the segment. The next
-                    // sync flushes the removal; a segment that came back after
-                    // a power loss would bring truncated records with it.
-                    fs::remove_file(entry.path())
-                        .map_err(|e| WalError::io("removing a truncated segment", e))?;
-                    let _ = self.write_map().remove(&index);
-                    self.dir_dirty.store(true, Ordering::Release);
-                }
-                std::cmp::Ordering::Equal => {
-                    // Straddles the new end: shrink it to the kept bytes.
-                    let file = self.segment_for_write(index)?;
-                    file.set_len(last_local)
-                        .map_err(|e| WalError::io("truncating a log segment", e))?;
-                }
-                std::cmp::Ordering::Less => {}
+            // A segment that would keep no bytes is removed, not emptied: an
+            // emptied file whose shrink a power loss undid would bring the
+            // dropped records back at the very offset they had.
+            let remove = index > last_index || (index == last_index && last_local == 0);
+            if remove {
+                // Drop our handle before unlinking — Windows refuses to remove a
+                // file that still has an open handle.
+                let _ = self.write_map().remove(&index);
+                fs::remove_file(entry.path())
+                    .map_err(|e| WalError::io("removing a truncated segment", e))?;
+                self.dir_dirty.store(true, Ordering::Release);
+            } else if index == last_index {
+                // Straddles the new end: shrink it and flush the shrink now.
+                let segment = self.segment_for_write(index)?;
+                segment
+                    .file
+                    .set_len(last_local)
+                    .map_err(|e| WalError::io("truncating a log segment", e))?;
+                durable_sync(&segment.file)
+                    .map_err(|e| WalError::io("flushing a truncated segment", e))?;
             }
         }
 
         self.max_written.store(len, Ordering::Relaxed);
-        self.synced_from.store(last_index, Ordering::Relaxed);
         Ok(())
     }
 
@@ -373,22 +503,22 @@ impl WalStore for SegmentedStore {
         flush_dir_if_dirty(&self.dir_dirty, &self.dir)?;
         flush_dir_if_dirty(&self.parent_dirty, &parent_dir(&self.dir))?;
 
-        let written = self.max_written.load(Ordering::Acquire);
-        if written == 0 {
-            return Ok(());
-        }
-        // The segment holding the last written byte.
-        let active = (written - 1) / self.segment_size;
-        let from = self.synced_from.load(Ordering::Acquire);
-
-        for index in from..=active {
-            if let Some(file) = self.open_segment(index) {
-                durable_sync(&file).map_err(|e| WalError::io("flushing to stable storage", e))?;
+        // Every segment written since its last flush, whichever it is: a record
+        // whose writer finished late may have landed in an older one.
+        let dirty: Vec<Arc<Segment>> = self
+            .read_map()
+            .values()
+            .filter(|segment| segment.dirty.load(Ordering::Acquire))
+            .cloned()
+            .collect();
+        for segment in dirty {
+            if segment.dirty.swap(false, Ordering::AcqRel) {
+                if let Err(e) = durable_sync(&segment.file) {
+                    segment.dirty.store(true, Ordering::Release);
+                    return Err(WalError::io("flushing to stable storage", e));
+                }
             }
         }
-        // Every segment below `active` is now full and durable; the active one
-        // may still grow, so it stays in the window for the next sync.
-        self.synced_from.store(active, Ordering::Release);
         Ok(())
     }
 
@@ -432,6 +562,7 @@ impl WalStore for SegmentedStore {
                 let _ = self.write_map().remove(&index);
                 fs::remove_file(entry.path())
                     .map_err(|e| WalError::io("removing a dropped segment", e))?;
+                self.dir_dirty.store(true, Ordering::Release);
             }
         }
 
@@ -464,6 +595,47 @@ mod tests {
 
     fn dir_dirty(store: &SegmentedStore) -> bool {
         store.dir_dirty.load(Ordering::Acquire)
+    }
+
+    fn segment_dirty(store: &SegmentedStore, index: u64) -> bool {
+        store.read_map()[&index].dirty.load(Ordering::Acquire)
+    }
+
+    /// The order the commit layer produces when a record that straddles a
+    /// segment boundary is reserved first but written last: a later record
+    /// completes, a sync runs, then the late bytes land in the older segment.
+    /// The sync that covers them must flush that older segment (before 1.4
+    /// it flushed only from the segment of the highest write on).
+    #[test]
+    fn test_a_late_write_into_an_older_segment_is_flushed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SegmentedStore::open(dir.path(), 64).unwrap();
+        store.write_at(0, &[1u8; 54]).unwrap();
+        store.sync().unwrap();
+        store.write_at(74, &[2u8; 30]).unwrap(); // the later record, segment 1
+        store.sync().unwrap();
+        assert!(!segment_dirty(&store, 0) && !segment_dirty(&store, 1));
+        store.write_at(54, &[3u8; 20]).unwrap(); // the late one, segments 0 and 1
+        assert!(segment_dirty(&store, 0) && segment_dirty(&store, 1));
+        store.sync().unwrap();
+        assert!(!segment_dirty(&store, 0) && !segment_dirty(&store, 1));
+    }
+
+    /// A reopened log flushes every segment before recovery trusts it: a
+    /// process that stopped without syncing may have left bytes only in the
+    /// page cache.
+    #[test]
+    fn test_open_flushes_every_existing_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = SegmentedStore::open(dir.path(), 64).unwrap();
+            store.write_at(0, &[1u8; 200]).unwrap(); // four segments, never synced
+        }
+        let store = SegmentedStore::open(dir.path(), 64).unwrap();
+        for index in 0..4 {
+            assert!(!segment_dirty(&store, index), "segment {index}");
+        }
+        assert_eq!(store.len().unwrap(), 200);
     }
 
     #[test]

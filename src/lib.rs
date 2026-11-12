@@ -100,10 +100,11 @@
 //!
 //! ## Status
 //!
-//! This is the `0.3` core: lock-free multi-writer append, group commit, and a
-//! frozen record format, on top of the platform-correct durability and
-//! torn-write recovery from `0.2`. Segment rotation follows in `0.3.1`. The
-//! four-call API is stable and will not change shape.
+//! Stable 1.x: lock-free multi-writer append, group commit, segmented logs,
+//! prefix and suffix truncation, and a frozen record format. The API does
+//! not change shape before 2.0. For typed records use the `pack-io-2`
+//! feature (`append_pack`, `Record::unpack`); the older `pack-io` feature's
+//! decoder is not bounded on hostile input.
 
 #![deny(warnings)]
 #![deny(missing_docs)]

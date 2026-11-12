@@ -61,27 +61,28 @@ pub enum RecoveryPolicy {
 /// # fn main() -> Result<(), WalError> {
 /// # let dir = tempfile::tempdir().map_err(WalError::from)?;
 /// # let path = dir.path().join("log.wal");
-/// // Two records, then damage in the first one's payload.
+/// // Three records, then damage in the second one's payload.
 /// let wal = Wal::open(&path)?;
 /// wal.append(b"first")?;
-/// wal.append(b"second")?;
+/// let second = wal.append(b"second")?;
+/// wal.append(b"third")?;
 /// wal.sync()?;
 /// drop(wal);
 /// let mut bytes = std::fs::read(&path).map_err(WalError::from)?;
-/// bytes[8] ^= 0xFF;
+/// bytes[second.get() as usize + 8] ^= 0xFF;
 /// std::fs::write(&path, &bytes).map_err(WalError::from)?;
 ///
 /// // Strict open refuses, because an intact record follows the damage, and
 /// // leaves the file as it was.
 /// let strict = WalConfig::new().with_open_policy(OpenPolicy::Strict);
 /// let refused = Wal::open_with(&path, strict);
-/// assert!(matches!(refused, Err(WalError::Corruption { offset: 0, .. })));
+/// assert!(matches!(refused, Err(WalError::Corruption { offset: 13, .. })));
 /// assert_eq!(std::fs::read(&path).map_err(WalError::from)?, bytes);
 ///
-/// // The default cuts the log at the damage, intact second record included.
+/// // The default cuts the log at the damage, intact third record included.
 /// let wal = Wal::open(&path)?;
 /// assert_eq!(wal.truncated_on_open(), 27);
-/// assert!(wal.is_empty());
+/// assert_eq!(wal.iter()?.count(), 1);
 /// # Ok(())
 /// # }
 /// ```
