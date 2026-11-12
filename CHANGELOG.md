@@ -20,7 +20,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [1.4.0] - 2026-11-12
 
-Durability and data-safety fixes from an independent review. The record
+Durability and data-safety fixes. The record
 format is unchanged and every existing log opens; segmented logs gain a `meta`
 file that records their segment size, which older readers ignore.
 
